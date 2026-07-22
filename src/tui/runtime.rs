@@ -1768,7 +1768,12 @@ fn flush_burst(tx: &mpsc::UnboundedSender<Event>, burst: Vec<Event>) -> bool {
 const PASTE_GRACE: Duration = Duration::from_millis(250);
 /// Continuation wait while a burst is forming or we're mid-paste: long enough to bridge chunk gaps,
 /// short enough to be imperceptible.
-const PASTE_COALESCE_WAIT: Duration = Duration::from_millis(30);
+const PASTE_COALESCE_WAIT: Duration = Duration::from_millis(40);
+/// Wait after the FIRST text key before deciding it was a lone keystroke. Non-zero so a paste whose
+/// characters arrive back-to-back (but not literally simultaneously — Windows ConPTY trickles them a
+/// couple ms apart) is detected as a burst instead of leaking through one key at a time (which let a
+/// pasted newline submit). Imperceptible for real typing (gaps are ~100ms).
+const PASTE_DETECT_WAIT: Duration = Duration::from_millis(20);
 
 fn spawn_input_reader(tx: mpsc::UnboundedSender<Event>) {
     std::thread::spawn(move || {
@@ -1794,16 +1799,19 @@ fn spawn_input_reader(tx: mpsc::UnboundedSender<Event>) {
                     }
 
                     if is_text_key(&ev) {
-                        // Coalesce a run of text keys. The first continuation read is instant so a
-                        // lone keystroke has no latency; once a burst forms (or we're mid-paste) we
-                        // wait a little between reads to bridge a chunked paste's internal gaps.
+                        // Coalesce a run of text keys. A short detect window on the first read
+                        // separates a paste (chars arrive within a few ms) from real typing (gaps
+                        // ~100ms); once a burst forms (or we're mid-paste) a longer window bridges a
+                        // chunked paste's internal gaps.
                         let mut burst = vec![ev];
                         let mut trailing = None;
                         loop {
                             let wait = if burst.len() >= 2 || paste_active {
                                 PASTE_COALESCE_WAIT
                             } else {
-                                Duration::from_millis(0)
+                                // First continuation read: a short detect window (not 0) so a paste
+                                // whose chars trickle a couple ms apart still coalesces.
+                                PASTE_DETECT_WAIT
                             };
                             match event::poll(wait) {
                                 Ok(true) => {

@@ -11,6 +11,15 @@ all four API families, builtin toolset with a native output optimizer, backgroun
 skills, sub-agents, autonomous ralph-loop, session persistence, permission rules, eight themes,
 and config hot-reload.
 
+## [0.1.4]
+
+### Fixed
+- **Terminal-native paste of large text no longer submits** — a paste via ctrl+shift+v / ctrl+v /
+  right-click (which the terminal delivers as a key stream, not a paste event) is now detected even
+  when the characters trickle a couple milliseconds apart, so it coalesces into a single paste
+  instead of leaking through one key at a time and letting an embedded newline fire the message.
+  (alt+v, which reads the clipboard directly, already worked.)
+
 ## [0.1.3]
 
 Paste robustness and a message action menu.
@@ -75,7 +84,8 @@ Input, provider, and reliability fixes.
 - **Update notification** — on startup Cordy checks crates.io (GitHub releases fallback) and, if a
   newer version is out, shows a notice and a footer badge.
 
-[Unreleased]: https://github.com/redstone-md/Cordy/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/redstone-md/Cordy/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/redstone-md/Cordy/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/redstone-md/Cordy/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/redstone-md/Cordy/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/redstone-md/Cordy/compare/v0.1.0...v0.1.1
