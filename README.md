@@ -12,6 +12,7 @@ MCP, skills, sub-agents, and background jobs — in one fast, keyboard-driven TU
 
 [![CI](https://github.com/redstone-md/Cordy/actions/workflows/ci.yml/badge.svg)](https://github.com/redstone-md/Cordy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/redstone-md/Cordy?display_name=tag&sort=semver)](https://github.com/redstone-md/Cordy/releases)
+[![crates.io](https://img.shields.io/crates/v/cordy?logo=rust)](https://crates.io/crates/cordy)
 [![License: MIT](https://img.shields.io/badge/license-MIT-6e9bf5)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-b7410e)](https://www.rust-lang.org)
 
@@ -48,6 +49,8 @@ compressed by a native token optimizer, and speaks the Model Context Protocol.
   <source media="(prefers-color-scheme: dark)" srcset="https://gfx.redstone.md/strip?label=Install&note=prebuilt%20binaries%20or%20from%20source&theme=dark">
   <img alt="Install" src="https://gfx.redstone.md/strip?label=Install&note=prebuilt%20binaries%20or%20from%20source&theme=light" width="840">
 </picture>
+
+**With cargo** — `cargo install cordy`
 
 **Prebuilt binaries** — grab the archive for your platform from the
 [latest release](https://github.com/redstone-md/Cordy/releases/latest), unpack, and run `cordy`.
