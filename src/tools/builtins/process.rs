@@ -206,7 +206,7 @@ impl BgRegistry {
             .iter()
             .map(|(id, j)| (id.clone(), j.command.clone(), j.status()))
             .collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v.sort_by_key(|x| x.0.clone()); // by id
         v
     }
 }

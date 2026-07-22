@@ -2,7 +2,7 @@
 name = "cordy"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "A cross-platform TUI coding agent in Rust — hot-swap any model/provider mid-conversation, MCP, skills, sub-agents, background jobs, and an OpenCode-inspired interface."
 authors = ["redstone.md"]
 license = "MIT"
@@ -40,5 +40,7 @@ url = "2.5.8"
 tempfile = "3.27.0"
 
 [features]
-# MCP client support (heavy dep; enable with `--features mcp`).
+# All features on by default — full build. Slim it with `--no-default-features`.
+default = ["mcp"]
+# MCP client support (pulls the heavier `rmcp` SDK).
 mcp = ["dep:rmcp"]

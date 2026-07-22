@@ -113,7 +113,7 @@ impl SessionStore {
                 metas.push(meta);
             }
         }
-        metas.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        metas.sort_by_key(|m| std::cmp::Reverse(m.created_at));
         metas
     }
 
@@ -182,7 +182,7 @@ impl SessionStore {
                 messages,
             });
         }
-        out.sort_by(|a, b| b.updated.cmp(&a.updated));
+        out.sort_by_key(|s| std::cmp::Reverse(s.updated));
         out
     }
 
