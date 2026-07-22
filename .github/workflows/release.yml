@@ -135,6 +135,8 @@ jobs:
           echo "tag=$tag  crate=$ver"
           [ "$tag" = "$ver" ] || { echo "::error::tag v$tag does not match Cargo.toml version $ver"; exit 1; }
       - name: cargo publish
-        run: cargo publish
+        # --allow-dirty: the verify build can regenerate Cargo.lock on the runner; that lone change
+        # must not abort the publish (the tag↔Cargo.toml version match is already asserted above).
+        run: cargo publish --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
