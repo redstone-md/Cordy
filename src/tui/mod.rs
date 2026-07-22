@@ -185,6 +185,12 @@ pub struct Model {
     /// Text columns available for one input row (excludes the prompt gutter); set during render
     /// so cursor navigation can follow wrapped visual lines.
     pub input_width: u16,
+    /// Transcript hit-testing (set during render): the viewport rect, the absolute index of the
+    /// first visible rendered line, and per-`transcript`-entry `(start_line, line_count)` ranges.
+    /// Used to map a mouse click back to the entry under it (click-to-rewind).
+    pub transcript_rect: Option<(u16, u16, u16, u16)>,
+    pub transcript_start: usize,
+    pub entry_spans: Vec<(usize, usize)>,
     /// Submitted-prompt history (newest last) and the browse cursor while pressing ↑/↓.
     pub history: Vec<String>,
     pub history_idx: Option<usize>,

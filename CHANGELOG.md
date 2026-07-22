@@ -11,6 +11,25 @@ all four API families, builtin toolset with a native output optimizer, backgroun
 skills, sub-agents, autonomous ralph-loop, session persistence, permission rules, eight themes,
 and config hot-reload.
 
+## [0.1.2]
+
+Follow-up input fixes.
+
+### Fixed
+- **Pasted newlines never submit, robustly** — post-paste grace window absorbs a trailing Enter
+  delivered a few ms late (terminals that split a paste into chunks), plus a short coalescing
+  window while a key-burst is forming.
+- **Queue no longer spams turns** — messages typed while busy are combined into a single prompt and
+  sent as one turn when the agent frees up.
+- **Interrupt keeps the queue** — Esc cancels the running turn but no longer discards queued
+  messages; they send once the turn unwinds.
+- **Image paste reachable** — clipboard paste is bound to alt+v and ctrl+shift+v as well as ctrl+v,
+  since terminals commonly intercept ctrl+v for their own text paste.
+
+### Added
+- **Click to rewind** — left-click a past user message to drop it and everything after (from the
+  display and the live conversation) and reload its text into the input for editing/resending.
+
 ## [0.1.1]
 
 Input, provider, and reliability fixes.
@@ -41,5 +60,6 @@ Input, provider, and reliability fixes.
 - **Update notification** — on startup Cordy checks crates.io (GitHub releases fallback) and, if a
   newer version is out, shows a notice and a footer badge.
 
-[Unreleased]: https://github.com/redstone-md/Cordy/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/redstone-md/Cordy/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/redstone-md/Cordy/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/redstone-md/Cordy/compare/v0.1.0...v0.1.1

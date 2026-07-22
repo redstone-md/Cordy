@@ -12,7 +12,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -83,6 +83,9 @@ enum Control {
     /// Drop / restore the last user+assistant exchange from the live session.
     UndoMessage,
     RedoMessage,
+    /// Rewind the live session to just before the Nth (0-based) user message — truncates the
+    /// conversation there so a resend replaces everything after it (click-to-rewind).
+    RewindTo(usize),
 }
 
 /// What a submitted keypress resolved to.
@@ -994,6 +997,23 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                                     persisted = session.messages.len();
                                 }
                             }
+                            Some(Control::RewindTo(n)) => {
+                                // Truncate at the Nth (0-based) user message so a resend replaces
+                                // everything from that message onward.
+                                if let Some(pos) = session
+                                    .messages
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, m)| m.role == Role::User)
+                                    .nth(n)
+                                    .map(|(i, _)| i)
+                                {
+                                    session.messages.truncate(pos);
+                                    // Disk is an append-only raw log; don't rewrite it.
+                                    persisted = session.messages.len();
+                                    redo_groups.clear();
+                                }
+                            }
                             Some(Control::LoadSession(id)) => {
                                 if let Ok((_m, msgs)) = store.load(&id) {
                                     session.messages = msgs;
@@ -1169,6 +1189,29 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                         } else {
                             model.scroll = model.scroll.saturating_sub(3);
                         }
+                    }
+                    // Left-click a past user message to rewind: drop it and everything after from
+                    // the display and the live conversation, and reload its text for editing.
+                    if let MouseEventKind::Down(MouseButton::Left) = m.kind
+                        && !model.busy
+                        && no_overlay(&model)
+                        && let Some(idx) = entry_at_click(&model, m.column, m.row)
+                        && let Some(Entry::User(text)) = model.transcript.get(idx).cloned()
+                    {
+                        let ordinal = model.transcript[..idx]
+                            .iter()
+                            .filter(|e| matches!(e, Entry::User(_)))
+                            .count();
+                        model.transcript.truncate(idx);
+                        model.msg_redo.clear();
+                        model.input = text;
+                        model.cursor = model.input.len();
+                        model.anchor = None;
+                        model.scroll = 0;
+                        model
+                            .transcript
+                            .push(Entry::System("↩ rewound — edit and press Enter to resend".into()));
+                        let _ = control_tx.send(Control::RewindTo(ordinal));
                     }
                 }
                 // Bracketed paste (or a coalesced key-burst): insert at the cursor, collapsing
@@ -1369,19 +1412,14 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                             let _ = control_tx.send(Control::Compact);
                         }
                         Some(KeyAction::Interrupt) => {
+                            // Cancel the running turn but KEEP the queue — queued messages were
+                            // typed intentionally and are sent as one turn once this one unwinds.
                             if let Ok(mut slot) = cancel_slot.lock()
                                 && let Some(tok) = slot.take()
                             {
                                 tok.cancel();
                             }
-                            let dropped = model.queue.len();
-                            model.queue.clear();
-                            let note = if dropped > 0 {
-                                format!("interrupted ({dropped} queued message(s) dropped)")
-                            } else {
-                                "interrupted".into()
-                            };
-                            model.transcript.push(Entry::System(note));
+                            model.transcript.push(Entry::System("interrupted".into()));
                         }
                         Some(KeyAction::NewSession) => {
                             model.transcript.clear();
@@ -1579,10 +1617,11 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                         secs: start.elapsed().as_secs_f64(),
                     });
                 }
-                // Drain one queued message once the turn is idle: feed it through the same submit
-                // path so it appears in the transcript and streams like a normal prompt.
+                // Drain the queue once the turn is idle: combine every message typed while busy
+                // into ONE prompt (joined by blank lines) and send it as a single turn, so a burst
+                // of queued messages doesn't spawn a wasteful turn each.
                 if !model.busy && !model.queue.is_empty() {
-                    let text = model.queue.remove(0);
+                    let text = std::mem::take(&mut model.queue).join("\n\n");
                     model.input = text;
                     if let Effect::Submit(t) = update(&mut model, Msg::Submit) {
                         let t = expand_pastes(&mut model, &t);
@@ -1678,6 +1717,15 @@ fn is_text_key(ev: &Event) -> bool {
     false
 }
 
+/// A bare Enter/Return keypress (no modifiers) — the ambiguous key that means "submit" when typed
+/// but "newline" when it arrives as part of a paste.
+fn is_plain_enter(ev: &Event) -> bool {
+    matches!(ev, Event::Key(k)
+        if k.kind != KeyEventKind::Release
+            && k.code == KeyCode::Enter
+            && !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER))
+}
+
 /// Forward a burst of text keys: 2+ back-to-back keys are a paste (terminals without bracketed
 /// paste), coalesced into one `Event::Paste` so an embedded Enter never submits. A lone key is
 /// forwarded unchanged. Returns `false` if the receiver is gone.
@@ -1704,38 +1752,76 @@ fn flush_burst(tx: &mpsc::UnboundedSender<Event>, burst: Vec<Event>) -> bool {
     true
 }
 
+/// Grace after a coalesced paste during which a lone Enter is treated as a paste straggler
+/// (newline) rather than a submit — covers terminals that deliver a paste split across chunks.
+const PASTE_GRACE: Duration = Duration::from_millis(60);
+
 fn spawn_input_reader(tx: mpsc::UnboundedSender<Event>) {
     std::thread::spawn(move || {
+        // While `Some`, we just flushed a paste and are within the grace window: a bare Enter now is
+        // almost certainly a straggler newline from the same paste, not an intentional submit.
+        let mut paste_until: Option<std::time::Instant> = None;
         loop {
             match event::poll(Duration::from_millis(100)) {
                 Ok(true) => {
                     let Ok(ev) = event::read() else { break };
+
+                    // Absorb a lone Enter that lands right after a paste as a newline.
+                    if is_plain_enter(&ev)
+                        && paste_until.is_some_and(|d| std::time::Instant::now() < d)
+                    {
+                        if tx.send(Event::Paste("\n".into())).is_err() {
+                            break;
+                        }
+                        paste_until = Some(std::time::Instant::now() + PASTE_GRACE);
+                        continue;
+                    }
+
                     if is_text_key(&ev) {
-                        // Greedily gather immediately-available text keys; a rapid run is a paste.
+                        // Gather a run of text keys. The first continuation read is instant (no
+                        // latency for lone keystrokes); once a burst is forming we wait a short
+                        // grace so paste stragglers — including a trailing Enter delivered a few ms
+                        // late — coalesce instead of submitting.
                         let mut burst = vec![ev];
                         let mut trailing = None;
-                        while let Ok(true) = event::poll(Duration::from_millis(0)) {
-                            let Ok(next) = event::read() else { break };
-                            if is_text_key(&next) {
-                                burst.push(next);
+                        loop {
+                            let wait = if burst.len() >= 2 {
+                                Duration::from_millis(15)
                             } else {
-                                trailing = Some(next);
-                                break;
+                                Duration::from_millis(0)
+                            };
+                            match event::poll(wait) {
+                                Ok(true) => {
+                                    let Ok(next) = event::read() else { break };
+                                    if is_text_key(&next) {
+                                        burst.push(next);
+                                    } else {
+                                        trailing = Some(next);
+                                        break;
+                                    }
+                                }
+                                _ => break,
                             }
                         }
+                        let was_paste = burst.len() >= 2;
                         if !flush_burst(&tx, burst) {
                             break;
                         }
+                        paste_until = was_paste.then(|| std::time::Instant::now() + PASTE_GRACE);
                         if let Some(t) = trailing
                             && tx.send(t).is_err()
                         {
                             break;
                         }
-                    } else if tx.send(ev).is_err() {
-                        break;
+                    } else {
+                        paste_until = None;
+                        if tx.send(ev).is_err() {
+                            break;
+                        }
                     }
                 }
                 Ok(false) => {
+                    paste_until = None;
                     if tx.is_closed() {
                         break;
                     }
@@ -1799,6 +1885,32 @@ fn latinize_code(code: KeyCode) -> KeyCode {
         KeyCode::Char(c) => KeyCode::Char(latinize(c)),
         other => other,
     }
+}
+
+/// No modal/overlay is currently capturing input — safe to act on a raw transcript click.
+fn no_overlay(model: &Model) -> bool {
+    !model.palette_open
+        && !model.sessions_open
+        && !model.providers_open
+        && !model.theme_open
+        && !model.status_open
+        && model.connect.is_none()
+        && model.pending.is_none()
+        && model.info.is_none()
+}
+
+/// Map a mouse click at absolute `(col, row)` to the transcript entry under it, using the layout
+/// stashed during render. Returns `None` if the click is outside the transcript or hits no entry.
+fn entry_at_click(model: &Model, col: u16, row: u16) -> Option<usize> {
+    let (rx, ry, rw, rh) = model.transcript_rect?;
+    if col < rx || col >= rx + rw || row < ry || row >= ry + rh {
+        return None;
+    }
+    let line_idx = model.transcript_start + (row - ry) as usize;
+    model
+        .entry_spans
+        .iter()
+        .position(|&(start, len)| line_idx >= start && line_idx < start + len)
 }
 
 /// Handle a keypress with OpenCode-style keybinds. Editing keys mutate the model directly;
@@ -2082,8 +2194,10 @@ fn handle_key(
         );
         return None;
     }
-    // ctrl+v: paste from the system clipboard — an image becomes an attachment, else text.
-    if ctrl && matches!(code, Char('v')) {
+    // Paste an image (or text) from the clipboard. Bound to ctrl+v, alt+v, and ctrl+shift+v —
+    // many terminals intercept plain ctrl+v for their own text paste, so alt+v / ctrl+shift+v are
+    // the reliable ways to reach the app for a clipboard IMAGE.
+    if (ctrl || alt) && matches!(code, Char('v')) {
         return Some(KeyAction::PasteClipboard);
     }
 
@@ -2909,9 +3023,12 @@ fn view(f: &mut Frame, model: &mut Model, theme: &Theme) {
         // Cards are pre-wrapped to the content width, so the Paragraph itself must NOT wrap.
         let cw = (chunks[0].width as usize).saturating_sub(2).max(14);
         let mut lines: Vec<Line> = Vec::new();
+        let mut entry_spans: Vec<(usize, usize)> = Vec::with_capacity(model.transcript.len());
         for e in &model.transcript {
+            let start_line = lines.len();
             lines.extend(render_entry(e, theme, model.show_tool_output, cw));
             lines.push(Line::raw(""));
+            entry_spans.push((start_line, lines.len() - start_line));
         }
         // Live reasoning (when display_thinking is on).
         if model.show_thinking && !model.thinking.is_empty() {
@@ -2944,6 +3061,10 @@ fn view(f: &mut Frame, model: &mut Model, theme: &Theme) {
             .saturating_sub(model.scroll as usize)
             .max(max.min(total));
         let start = end.saturating_sub(max);
+        // Stash layout for mouse hit-testing (click-to-rewind maps a click row → transcript entry).
+        model.transcript_start = start;
+        model.transcript_rect = Some((chunks[0].x, chunks[0].y, chunks[0].width, chunks[0].height));
+        model.entry_spans = entry_spans;
         let view_lines = lines[start..end].to_vec();
         f.render_widget(
             Paragraph::new(view_lines).block(Block::default().padding(Padding::new(1, 1, 0, 0))),
@@ -2963,6 +3084,8 @@ fn view(f: &mut Frame, model: &mut Model, theme: &Theme) {
             );
         }
     } else {
+        model.transcript_rect = None;
+        model.entry_spans.clear();
         f.render_widget(splash(chunks[0].height, theme), chunks[0]);
     }
 
