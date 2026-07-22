@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="https://gfx.redstone.md/strip?label=Cordy&note=a%20terminal%20coding%20agent%20in%20Rust&theme=dark" alt="Cordy" width="840">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://gfx.redstone.md/strip?label=Cordy&note=a%20terminal%20coding%20agent%20in%20Rust&theme=dark">
+  <img alt="Cordy — a terminal coding agent in Rust" src="https://gfx.redstone.md/strip?label=Cordy&note=a%20terminal%20coding%20agent%20in%20Rust&theme=light" width="840">
+</picture>
 
 **English** · [Русский](README.ru.md)
 
@@ -20,7 +23,10 @@ through one canonical model, so switching provider or model never loses your con
 edits files with an exact, diff-confirmed `edit`, runs a builtin toolset whose command output is
 compressed by a native token optimizer, and speaks the Model Context Protocol.
 
-<img src="https://gfx.redstone.md/strip?label=Highlights&theme=dark" alt="Highlights" width="840">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://gfx.redstone.md/strip?label=Highlights&note=what%20sets%20it%20apart&theme=dark">
+  <img alt="Highlights" src="https://gfx.redstone.md/strip?label=Highlights&note=what%20sets%20it%20apart&theme=light" width="840">
+</picture>
 
 - **Hot-swap models & providers** mid-conversation — start on a local model, finish on a frontier
   one, context intact. `^P` → pick a model, or `/connect` to add a provider.
@@ -38,12 +44,15 @@ compressed by a native token optimizer, and speaks the Model Context Protocol.
 - **OpenCode-inspired UI** — command palette, prompt history, multiline input, sessions, a
   provider manager, eight themes, and full config hot-reload.
 
-<img src="https://gfx.redstone.md/strip?label=Install&theme=dark" alt="Install" width="840">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://gfx.redstone.md/strip?label=Install&note=prebuilt%20binaries%20or%20from%20source&theme=dark">
+  <img alt="Install" src="https://gfx.redstone.md/strip?label=Install&note=prebuilt%20binaries%20or%20from%20source&theme=light" width="840">
+</picture>
 
 **Prebuilt binaries** — grab the archive for your platform from the
 [latest release](https://github.com/redstone-md/Cordy/releases/latest), unpack, and run `cordy`.
 
-**From source** (Rust 1.85+):
+**From source** (Rust 1.88+) — the default build is full-featured (MCP included):
 
 ```sh
 git clone https://github.com/redstone-md/Cordy.git
@@ -52,13 +61,12 @@ cargo build --release
 # binary at target/release/cordy
 ```
 
-Enable the optional MCP client (pulls the heavier `rmcp` SDK):
+Want a leaner binary without the MCP client? `cargo build --release --no-default-features`.
 
-```sh
-cargo build --release --features mcp
-```
-
-<img src="https://gfx.redstone.md/strip?label=Quick%20start&theme=dark" alt="Quick start" width="840">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://gfx.redstone.md/strip?label=Quick%20start&note=connect%20a%20provider%20and%20go&theme=dark">
+  <img alt="Quick start" src="https://gfx.redstone.md/strip?label=Quick%20start&note=connect%20a%20provider%20and%20go&theme=light" width="840">
+</picture>
 
 Point Cordy at any OpenAI-compatible endpoint via environment variables, then run it:
 
@@ -73,9 +81,10 @@ cordy
 wizard. Providers you connect are saved to `~/.cordy/config.toml`, and the last one is restored on
 launch. All user state — config, keys, sessions, cache — lives under `~/.cordy`.
 
-<img src="https://gfx.redstone.md/strip?label=Keybinds&theme=dark" alt="Keybinds" width="840">
-
-Keybinds follow OpenCode. A few of the essentials:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://gfx.redstone.md/strip?label=Keybinds&note=OpenCode-style&theme=dark">
+  <img alt="Keybinds" src="https://gfx.redstone.md/strip?label=Keybinds&note=OpenCode-style&theme=light" width="840">
+</picture>
 
 | Key | Action |
 | --- | --- |
@@ -91,7 +100,10 @@ Keybinds follow OpenCode. A few of the essentials:
 Slash commands include `/connect` `/providers` `/model` `/sessions` `/permissions` `/mouse`
 `/thinking` `/compact` `/goal` `/ralph` and more — type `/` to autocomplete.
 
-<img src="https://gfx.redstone.md/strip?label=Configuration&theme=dark" alt="Configuration" width="840">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://gfx.redstone.md/strip?label=Configuration&note=hot-reloaded%20%C2%B7%20secrets%20stay%20in%20env&theme=dark">
+  <img alt="Configuration" src="https://gfx.redstone.md/strip?label=Configuration&note=hot-reloaded%20%C2%B7%20secrets%20stay%20in%20env&theme=light" width="840">
+</picture>
 
 `~/.cordy/config.toml` (merged with a project-level `.cordy/config.toml`). It is **hot-reloaded**
 — edits apply within a second, no restart. Secrets never live here; API keys go in the OS env or
@@ -99,7 +111,7 @@ Slash commands include `/connect` `/providers` `/model` `/sessions` `/permission
 
 ```toml
 optimize = true
-theme = "tokyonight"   # dark · tokyonight · catppuccin · gruvbox · nord · rosepine · light · mono
+theme = "tokyonight"   # mono (default) · dark · tokyonight · catppuccin · gruvbox · nord · rosepine · light
 
 # Fine-tune any role color on top of the theme
 [colors]
@@ -118,7 +130,7 @@ name = "openai"
 kind = "openai-chat"
 base_url = "https://api.openai.com/v1"
 
-# An MCP server (requires a build with --features mcp)
+# An MCP server (in the default build)
 [[mcp]]
 name = "browsermcp"
 transport = "stdio"
@@ -126,9 +138,10 @@ command = "npx @browsermcp/mcp@latest"
 enabled = true
 ```
 
-<img src="https://gfx.redstone.md/strip?label=Project%20layout&theme=dark" alt="Project layout" width="840">
-
-One binary crate, module boundaries by trait + `mod` privacy:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://gfx.redstone.md/strip?label=Project%20layout&note=one%20crate%2C%20clean%20module%20boundaries&theme=dark">
+  <img alt="Project layout" src="https://gfx.redstone.md/strip?label=Project%20layout&note=one%20crate%2C%20clean%20module%20boundaries&theme=light" width="840">
+</picture>
 
 ```
 src/
@@ -138,12 +151,15 @@ src/
   tools/      Tool trait, builtins, native output optimizer, sub-agents, background jobs
   skills/     progressive-disclosure skill loader
   agents/     sub-agent registry
-  mcp/        MCP client (feature-gated)
+  mcp/        MCP client (on by default; opt out with --no-default-features)
   config/     TOML load/merge, model & provider profiles
   tui/        ratatui MVU app — model, update, view, themes, markdown
 ```
 
-<img src="https://gfx.redstone.md/strip?label=Contributing&theme=dark" alt="Contributing" width="840">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://gfx.redstone.md/strip?label=Contributing&note=fmt%20%C2%B7%20clippy%20%C2%B7%20test&theme=dark">
+  <img alt="Contributing" src="https://gfx.redstone.md/strip?label=Contributing&note=fmt%20%C2%B7%20clippy%20%C2%B7%20test&theme=light" width="840">
+</picture>
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Before opening a PR:
 
@@ -153,7 +169,10 @@ cargo clippy --all-targets
 cargo test
 ```
 
-<img src="https://gfx.redstone.md/strip?label=License&theme=dark" alt="License" width="840">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://gfx.redstone.md/strip?label=License&note=MIT&theme=dark">
+  <img alt="License" src="https://gfx.redstone.md/strip?label=License&note=MIT&theme=light" width="840">
+</picture>
 
 Released under the [MIT License](LICENSE).
 
