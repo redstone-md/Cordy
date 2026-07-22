@@ -1660,6 +1660,36 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                     dirty = true;
                 }
 
+                // Proactive events: when a background job finishes on its own, feed the outcome to
+                // the agent even if the user hasn't typed anything — so a failed/completed task or a
+                // met condition reaches the agent and it can follow up autonomously.
+                if !model.busy && model.queue.is_empty() {
+                    let events = bg.take_finished_events();
+                    if !events.is_empty() {
+                        let mut note = String::from(
+                            "[automated event] Background job(s) finished while you were idle. \
+                             Review the outcome below and take any needed follow-up action; if \
+                             nothing is needed, briefly say so.\n",
+                        );
+                        for e in &events {
+                            note.push_str(&format!(
+                                "\n• job {} ({}) — {}\n--- recent output ---\n{}\n",
+                                e.id, e.command, e.status, e.output_tail
+                            ));
+                            model.transcript.push(Entry::System(format!(
+                                "⚡ background job {} {} — notifying agent",
+                                e.id, e.status
+                            )));
+                        }
+                        model.busy = true;
+                        model.status = "thinking…".into();
+                        model.scroll = 0;
+                        turn_start = Some(std::time::Instant::now());
+                        let _ = prompt_tx.send(vec![ContentBlock::text(note)]);
+                        dirty = true;
+                    }
+                }
+
                 // Config hot-reload (~ every second): re-apply theme/colors, statusline, mascot,
                 // permissions, and the palette when the config files change on disk.
                 reload_tick = reload_tick.wrapping_add(1);
@@ -4601,7 +4631,13 @@ fn render_entry(
     match e {
         Entry::User(t) => user_block(t, theme, width),
         Entry::Assistant(t) => assistant_block(t, theme, false, width),
-        Entry::Tool { name, text, saved } => {
+        Entry::Tool {
+            name,
+            text,
+            saved,
+            running,
+            ..
+        } => {
             let inner = width.clamp(16, MAX_CARD).saturating_sub(4);
             let mut head = vec![
                 Span::styled("  ", Style::default()),
@@ -4610,6 +4646,14 @@ fn render_entry(
                     Style::default().fg(theme.tool).add_modifier(Modifier::BOLD),
                 ),
             ];
+            if *running {
+                head.push(Span::styled(
+                    "  · running…",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+            }
             if *saved > 0 {
                 head.push(Span::styled(
                     format!("  · saved ~{saved}"),

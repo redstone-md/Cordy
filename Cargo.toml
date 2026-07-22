@@ -1,6 +1,6 @@
 [package]
 name = "cordy"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.88"
 description = "A cross-platform TUI coding agent in Rust — hot-swap any model/provider mid-conversation, MCP, skills, sub-agents, background jobs, and an OpenCode-inspired interface."

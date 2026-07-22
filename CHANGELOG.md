@@ -11,6 +11,21 @@ all four API families, builtin toolset with a native output optimizer, backgroun
 skills, sub-agents, autonomous ralph-loop, session persistence, permission rules, eight themes,
 and config hot-reload.
 
+## [0.1.5]
+
+### Added
+- **Proactive background-job events** — when a background job finishes on its own (a build
+  completes, a dev server crashes, a watched condition is met), the agent is notified and can act
+  on it automatically, even if you haven't typed anything.
+
+### Fixed
+- **Tool calls display live** — a tool now appears in the transcript the moment it starts running
+  (with a one-line arg preview and a "running…" marker) and fills in its output when done, instead
+  of only showing up after it finishes.
+- **Interrupt aborts a hung tool** — Esc now cancels a stuck tool call immediately (dropping it
+  also kills any spawned child process via kill-on-drop); the turn ends with the tool marked
+  interrupted and the conversation left in a valid state.
+
 ## [0.1.4]
 
 ### Fixed
@@ -84,7 +99,8 @@ Input, provider, and reliability fixes.
 - **Update notification** — on startup Cordy checks crates.io (GitHub releases fallback) and, if a
   newer version is out, shows a notice and a footer badge.
 
-[Unreleased]: https://github.com/redstone-md/Cordy/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/redstone-md/Cordy/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/redstone-md/Cordy/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/redstone-md/Cordy/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/redstone-md/Cordy/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/redstone-md/Cordy/compare/v0.1.1...v0.1.2

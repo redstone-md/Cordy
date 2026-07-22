@@ -32,6 +32,8 @@ struct Job {
     kill: Option<oneshot::Sender<()>>,
     /// How many bytes of `output` the agent has already been shown (for incremental reads).
     seen: usize,
+    /// Whether this job's completion has been surfaced to the agent as a proactive event.
+    reported: bool,
 }
 
 impl Job {
@@ -46,6 +48,14 @@ impl Job {
             "running".into()
         }
     }
+}
+
+/// A finished background job surfaced to the agent proactively (see [`BgRegistry::take_finished_events`]).
+pub struct BgEvent {
+    pub id: String,
+    pub command: String,
+    pub status: String,
+    pub output_tail: String,
 }
 
 /// Shared registry of background jobs, cloneable so tools can share one instance.
@@ -129,9 +139,46 @@ impl BgRegistry {
                 exit,
                 kill: Some(kill_tx),
                 seen: 0,
+                reported: false,
             },
         );
         Ok(id)
+    }
+
+    /// Background jobs that have finished since the last call, marking them reported so each is
+    /// surfaced once. Drives proactive notification: the runtime feeds these to the agent even when
+    /// the user hasn't typed anything.
+    pub fn take_finished_events(&self) -> Vec<BgEvent> {
+        let mut st = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        for (id, job) in st.jobs.iter_mut() {
+            if job.done.load(Ordering::SeqCst) && !job.reported {
+                job.reported = true;
+                // A deliberate kill (-2) isn't a surprise worth interrupting the agent for.
+                if *job.exit.lock().unwrap() == Some(-2) {
+                    continue;
+                }
+                let full = job.output.lock().unwrap().clone();
+                let tail = if full.chars().count() > 2000 {
+                    let start = full
+                        .char_indices()
+                        .nth_back(1999)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    format!("…{}", &full[start..])
+                } else {
+                    full
+                };
+                out.push(BgEvent {
+                    id: id.clone(),
+                    command: job.command.clone(),
+                    status: job.status(),
+                    output_tail: tail,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
     }
 
     /// New output since the last read for `id`, plus its status. Advances the read cursor.

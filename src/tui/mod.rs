@@ -20,9 +20,13 @@ pub enum Entry {
     User(String),
     Assistant(String),
     Tool {
+        /// Tool-call id, so a live "running" entry can be updated in place when it finishes.
+        id: String,
         name: String,
         text: String,
         saved: u64,
+        /// True while the tool is executing (shown before its output arrives).
+        running: bool,
     },
     System(String),
     /// Completion footer under an assistant reply: mode chip + model + elapsed seconds.
@@ -843,22 +847,84 @@ fn word_start(s: &str, i: usize) -> usize {
     j
 }
 
+/// A compact one-line preview of a tool's arguments for the live "running" row.
+fn tool_arg_preview(input: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let raw = match input {
+        Value::Object(map) => {
+            let mut pick = None;
+            for k in [
+                "command",
+                "cmd",
+                "path",
+                "file_path",
+                "pattern",
+                "query",
+                "url",
+                "id",
+            ] {
+                if let Some(Value::String(v)) = map.get(k) {
+                    pick = Some(v.clone());
+                    break;
+                }
+            }
+            pick.unwrap_or_else(|| input.to_string())
+        }
+        Value::String(s) => s.clone(),
+        Value::Null => return String::new(),
+        other => other.to_string(),
+    };
+    let one = raw.lines().next().unwrap_or("").trim();
+    if one.chars().count() > 100 {
+        format!("{}…", one.chars().take(100).collect::<String>())
+    } else {
+        one.to_string()
+    }
+}
+
 /// Fold an agent event into the transcript / streaming buffer.
 fn apply_agent(model: &mut Model, ev: AgentEvent) {
     match ev {
         AgentEvent::TextDelta(s) => model.streaming.push_str(&s),
         AgentEvent::ThinkingDelta(s) => model.thinking.push_str(&s),
-        AgentEvent::ToolStarted { name, .. } => {
+        AgentEvent::ToolStarted { id, name, input } => {
             flush_streaming(model);
             model.status = format!("running {name}…");
-        }
-        AgentEvent::ToolFinished { name, output, .. } => {
-            model.total_saved += output.saved;
+            // Show the tool live (with a one-line arg preview) the moment it starts.
             model.transcript.push(Entry::Tool {
+                id,
                 name,
-                text: output.text,
-                saved: output.saved,
+                text: tool_arg_preview(&input),
+                saved: 0,
+                running: true,
             });
+        }
+        AgentEvent::ToolFinished { id, name, output } => {
+            model.total_saved += output.saved;
+            // Resolve the matching live entry in place; fall back to appending if none is found.
+            if let Some(Entry::Tool {
+                text,
+                saved,
+                running,
+                ..
+            }) = model
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|e| matches!(e, Entry::Tool { id: eid, running: true, .. } if *eid == id))
+            {
+                *text = output.text;
+                *saved = output.saved;
+                *running = false;
+            } else {
+                model.transcript.push(Entry::Tool {
+                    id,
+                    name,
+                    text: output.text,
+                    saved: output.saved,
+                    running: false,
+                });
+            }
         }
         AgentEvent::TurnComplete { usage } => {
             flush_streaming(model);

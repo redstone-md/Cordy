@@ -26,6 +26,7 @@ pub enum AgentEvent {
     ToolStarted {
         id: String,
         name: String,
+        input: Value,
     },
     ToolFinished {
         id: String,
@@ -129,13 +130,11 @@ impl AgentLoop {
             let tap = events.clone();
             let (assistant, usage) = tokio::select! {
                 r = assemble_with(stream, move |ev| {
+                    // Tool starts are surfaced from the execution loop below (with full args, and
+                    // right when they begin running) rather than mid-stream before the args exist.
                     let mapped = match ev {
                         WireEvent::TextDelta(s) => Some(AgentEvent::TextDelta(s.clone())),
                         WireEvent::ThinkingDelta(s) => Some(AgentEvent::ThinkingDelta(s.clone())),
-                        WireEvent::ToolUseStart { id, name } => Some(AgentEvent::ToolStarted {
-                            id: id.clone(),
-                            name: name.clone(),
-                        }),
                         _ => None,
                     };
                     if let Some(m) = mapped {
@@ -178,9 +177,34 @@ impl AgentLoop {
             }
 
             let mut results = Vec::with_capacity(tool_uses.len());
+            let mut interrupted = false;
             for (id, name, input) in tool_uses {
+                // Once interrupted, still emit a result for every remaining tool_use so the tool
+                // message stays valid (providers reject a tool_use with no matching tool_result).
+                if interrupted {
+                    results.push(ContentBlock::ToolResult {
+                        id,
+                        out: ToolOutput::error("interrupted"),
+                    });
+                    continue;
+                }
+                // Announce the tool (with its args) the moment it starts running — the UI shows it
+                // live instead of only after it returns.
+                let _ = events.send(AgentEvent::ToolStarted {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                });
                 let output = match self.registry.get(&name) {
-                    Some(tool) => tool.run(input, &self.ctx).await,
+                    // Race the tool against cancellation so Esc aborts a hung tool immediately
+                    // (dropping the future also kills a spawned child via `kill_on_drop`).
+                    Some(tool) => tokio::select! {
+                        o = tool.run(input, &self.ctx) => o,
+                        _ = cancel.cancelled() => {
+                            interrupted = true;
+                            ToolOutput::error("interrupted")
+                        }
+                    },
                     None => ToolOutput::error(format!("unknown tool: {name}")),
                 };
                 let _ = events.send(AgentEvent::ToolFinished {
@@ -194,6 +218,12 @@ impl AgentLoop {
                 role: Role::Tool,
                 content: results,
             });
+            if interrupted {
+                let _ = events.send(AgentEvent::TurnComplete {
+                    usage: Usage::default(),
+                });
+                return Ok(());
+            }
         }
     }
 }
