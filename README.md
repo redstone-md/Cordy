@@ -50,9 +50,24 @@ compressed by a native token optimizer, and speaks the Model Context Protocol.
   <img alt="Install" src="https://gfx.redstone.md/strip?label=Install&note=prebuilt%20binaries%20or%20from%20source&theme=light" width="840">
 </picture>
 
+**Linux / macOS**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/redstone-md/Cordy/main/install.sh | sh
+```
+
+**Windows** (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/redstone-md/Cordy/main/install.ps1 | iex
+```
+
+The scripts download the signed binary for your platform, verify its checksum, and drop `cordy`
+on your `PATH`.
+
 **With cargo** — `cargo install cordy`
 
-**Prebuilt binaries** — grab the archive for your platform from the
+**Prebuilt binaries** — or grab the archive for your platform from the
 [latest release](https://github.com/redstone-md/Cordy/releases/latest), unpack, and run `cordy`.
 
 **From source** (Rust 1.88+) — the default build is full-featured (MCP included):
