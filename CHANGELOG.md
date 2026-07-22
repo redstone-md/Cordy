@@ -11,6 +11,21 @@ all four API families, builtin toolset with a native output optimizer, backgroun
 skills, sub-agents, autonomous ralph-loop, session persistence, permission rules, eight themes,
 and config hot-reload.
 
+## [0.1.3]
+
+Paste robustness and a message action menu.
+
+### Fixed
+- **Large / chunked pastes never auto-submit** — the input reader now stays in a self-extending
+  "paste window" for the whole paste, so a newline in the middle (or a lone Enter a terminal
+  delivers in a separate chunk, as Windows ConPTY does for big pastes) becomes a newline, never a
+  submit. Previously a long paste could fire the message immediately.
+
+### Changed
+- **Clicking a message opens an action menu** instead of rewinding immediately — pick **Copy**,
+  **Rewind & edit**, or **Delete from here** (navigable by mouse or ↑/↓ + Enter, Esc to close).
+  Assistant/tool/system messages offer **Copy**.
+
 ## [0.1.2]
 
 Follow-up input fixes.
@@ -60,6 +75,7 @@ Input, provider, and reliability fixes.
 - **Update notification** — on startup Cordy checks crates.io (GitHub releases fallback) and, if a
   newer version is out, shows a notice and a footer badge.
 
-[Unreleased]: https://github.com/redstone-md/Cordy/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/redstone-md/Cordy/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/redstone-md/Cordy/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/redstone-md/Cordy/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/redstone-md/Cordy/compare/v0.1.0...v0.1.1

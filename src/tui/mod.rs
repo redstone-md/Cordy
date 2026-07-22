@@ -56,6 +56,18 @@ pub struct PaletteItem {
     pub action: PaletteAction,
 }
 
+/// A small action menu opened by clicking a transcript message (copy / rewind / delete).
+#[derive(Debug, Clone)]
+pub struct MsgMenu {
+    /// Index into `transcript` of the clicked entry.
+    pub entry: usize,
+    /// Highlighted action row.
+    pub sel: usize,
+    /// Anchor position (mouse column/row) the popup is drawn at.
+    pub col: u16,
+    pub row: u16,
+}
+
 /// Which step of the `/connect` provider wizard is showing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectStep {
@@ -191,6 +203,10 @@ pub struct Model {
     pub transcript_rect: Option<(u16, u16, u16, u16)>,
     pub transcript_start: usize,
     pub entry_spans: Vec<(usize, usize)>,
+    /// Open message-action menu (click a message), if any.
+    pub msg_menu: Option<MsgMenu>,
+    /// The menu popup's resolved rect `(x, y, w, h)`, stashed during render for click hit-testing.
+    pub msg_menu_rect: Option<(u16, u16, u16, u16)>,
     /// Submitted-prompt history (newest last) and the browse cursor while pressing ↑/↓.
     pub history: Vec<String>,
     pub history_idx: Option<usize>,

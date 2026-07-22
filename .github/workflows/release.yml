@@ -92,13 +92,23 @@ jobs:
             --output-certificate SHA256SUMS.pem
 
       - name: Generate release notes
-        uses: orhun/git-cliff-action@v4
-        id: cliff
-        with:
-          config: cliff.toml
-          args: --latest --strip header
-        env:
-          OUTPUT: RELEASE_NOTES.md
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          # Pull this version's hand-written section out of CHANGELOG.md (everything between its
+          # `## [x.y.z]` heading and the next `## [` heading or the link-reference block). Literal
+          # `index` matching avoids awk treating the `[` brackets as a regex character class.
+          awk -v ver="$ver" '
+            index($0, "## [" ver "]") == 1 { flag=1; next }
+            flag && index($0, "## [") == 1 { flag=0 }
+            flag && substr($0, 1, 1) == "[" { flag=0 }
+            flag { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            printf 'Release %s\n' "$ver" > RELEASE_NOTES.md
+          fi
+          echo "----- release notes -----"
+          cat RELEASE_NOTES.md
 
       - name: Publish release
         uses: softprops/action-gh-release@v2

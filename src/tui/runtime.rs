@@ -139,6 +139,8 @@ enum KeyAction {
     DeleteProvider(String),
     /// Paste from the system clipboard: an image is saved + attached as `@image`, else text.
     PasteClipboard,
+    /// Run the highlighted item in the open message-action menu.
+    MsgMenuExec,
 }
 
 /// Permission gate backed by the UI: forwards a request to the event loop and awaits the user's
@@ -1190,28 +1192,32 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                             model.scroll = model.scroll.saturating_sub(3);
                         }
                     }
-                    // Left-click a past user message to rewind: drop it and everything after from
-                    // the display and the live conversation, and reload its text for editing.
-                    if let MouseEventKind::Down(MouseButton::Left) = m.kind
-                        && !model.busy
-                        && no_overlay(&model)
-                        && let Some(idx) = entry_at_click(&model, m.column, m.row)
-                        && let Some(Entry::User(text)) = model.transcript.get(idx).cloned()
-                    {
-                        let ordinal = model.transcript[..idx]
-                            .iter()
-                            .filter(|e| matches!(e, Entry::User(_)))
-                            .count();
-                        model.transcript.truncate(idx);
-                        model.msg_redo.clear();
-                        model.input = text;
-                        model.cursor = model.input.len();
-                        model.anchor = None;
-                        model.scroll = 0;
-                        model
-                            .transcript
-                            .push(Entry::System("↩ rewound — edit and press Enter to resend".into()));
-                        let _ = control_tx.send(Control::RewindTo(ordinal));
+                    if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                        if model.msg_menu.is_some() {
+                            // A click while the menu is open: run the item under the cursor, else
+                            // close the menu.
+                            match menu_item_at(&model, m.column, m.row) {
+                                Some(sel) => {
+                                    if let Some(mm) = &mut model.msg_menu {
+                                        mm.sel = sel;
+                                    }
+                                    run_msg_menu(&mut model, &control_tx);
+                                }
+                                None => model.msg_menu = None,
+                            }
+                        } else if !model.busy
+                            && no_overlay(&model)
+                            && let Some(idx) = entry_at_click(&model, m.column, m.row)
+                            && !menu_actions(&model.transcript[idx]).is_empty()
+                        {
+                            // Open the action menu anchored at the click.
+                            model.msg_menu = Some(super::MsgMenu {
+                                entry: idx,
+                                sel: 0,
+                                col: m.column,
+                                row: m.row,
+                            });
+                        }
                     }
                 }
                 // Bracketed paste (or a coalesced key-burst): insert at the cursor, collapsing
@@ -1590,6 +1596,9 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                             model.suggestions = compute_suggestions(&model.input, &cwd);
                             model.suggestion_sel = 0;
                         }
+                        Some(KeyAction::MsgMenuExec) => {
+                            run_msg_menu(&mut model, &control_tx);
+                        }
                         None => {}
                     }
                     // Refresh inline autocomplete suggestions after any input change. Reset the
@@ -1752,24 +1761,31 @@ fn flush_burst(tx: &mpsc::UnboundedSender<Event>, burst: Vec<Event>) -> bool {
     true
 }
 
-/// Grace after a coalesced paste during which a lone Enter is treated as a paste straggler
-/// (newline) rather than a submit — covers terminals that deliver a paste split across chunks.
-const PASTE_GRACE: Duration = Duration::from_millis(60);
+/// Once a paste is detected we stay in "paste mode" until this long a silence. Any text input
+/// during the window extends it, so even a large paste that a terminal (notably Windows ConPTY)
+/// delivers in slow chunks stays coalesced, and a bare Enter inside it becomes a newline — never a
+/// submit. A real Enter-to-send comes only after the user pauses, well past this window.
+const PASTE_GRACE: Duration = Duration::from_millis(250);
+/// Continuation wait while a burst is forming or we're mid-paste: long enough to bridge chunk gaps,
+/// short enough to be imperceptible.
+const PASTE_COALESCE_WAIT: Duration = Duration::from_millis(30);
 
 fn spawn_input_reader(tx: mpsc::UnboundedSender<Event>) {
     std::thread::spawn(move || {
-        // While `Some`, we just flushed a paste and are within the grace window: a bare Enter now is
-        // almost certainly a straggler newline from the same paste, not an intentional submit.
+        // While within this deadline we're in a paste: a bare Enter is a straggler newline, and any
+        // text input pushes the deadline out.
         let mut paste_until: Option<std::time::Instant> = None;
+        let in_paste = |until: &Option<std::time::Instant>| {
+            until.is_some_and(|d| std::time::Instant::now() < d)
+        };
         loop {
             match event::poll(Duration::from_millis(100)) {
                 Ok(true) => {
                     let Ok(ev) = event::read() else { break };
+                    let paste_active = in_paste(&paste_until);
 
-                    // Absorb a lone Enter that lands right after a paste as a newline.
-                    if is_plain_enter(&ev)
-                        && paste_until.is_some_and(|d| std::time::Instant::now() < d)
-                    {
+                    // A bare Enter during a paste is a newline from the paste, not a submit.
+                    if paste_active && is_plain_enter(&ev) {
                         if tx.send(Event::Paste("\n".into())).is_err() {
                             break;
                         }
@@ -1778,15 +1794,14 @@ fn spawn_input_reader(tx: mpsc::UnboundedSender<Event>) {
                     }
 
                     if is_text_key(&ev) {
-                        // Gather a run of text keys. The first continuation read is instant (no
-                        // latency for lone keystrokes); once a burst is forming we wait a short
-                        // grace so paste stragglers — including a trailing Enter delivered a few ms
-                        // late — coalesce instead of submitting.
+                        // Coalesce a run of text keys. The first continuation read is instant so a
+                        // lone keystroke has no latency; once a burst forms (or we're mid-paste) we
+                        // wait a little between reads to bridge a chunked paste's internal gaps.
                         let mut burst = vec![ev];
                         let mut trailing = None;
                         loop {
-                            let wait = if burst.len() >= 2 {
-                                Duration::from_millis(15)
+                            let wait = if burst.len() >= 2 || paste_active {
+                                PASTE_COALESCE_WAIT
                             } else {
                                 Duration::from_millis(0)
                             };
@@ -1803,17 +1818,20 @@ fn spawn_input_reader(tx: mpsc::UnboundedSender<Event>) {
                                 _ => break,
                             }
                         }
-                        let was_paste = burst.len() >= 2;
+                        // A multi-key burst is a paste; a single key while already pasting continues
+                        // one. Either way, (re)arm the paste window so following Enters stay newlines.
+                        let is_paste = burst.len() >= 2 || paste_active;
                         if !flush_burst(&tx, burst) {
                             break;
                         }
-                        paste_until = was_paste.then(|| std::time::Instant::now() + PASTE_GRACE);
+                        paste_until = is_paste.then(|| std::time::Instant::now() + PASTE_GRACE);
                         if let Some(t) = trailing
                             && tx.send(t).is_err()
                         {
                             break;
                         }
                     } else {
+                        // A non-text event (arrow, ctrl-combo, mouse) ends paste mode.
                         paste_until = None;
                         if tx.send(ev).is_err() {
                             break;
@@ -1821,7 +1839,8 @@ fn spawn_input_reader(tx: mpsc::UnboundedSender<Event>) {
                     }
                 }
                 Ok(false) => {
-                    paste_until = None;
+                    // Idle: let the time-based deadline decide; don't force-clear (a paste may have a
+                    // brief stall). `is_closed` is the real shutdown signal.
                     if tx.is_closed() {
                         break;
                     }
@@ -1897,6 +1916,7 @@ fn no_overlay(model: &Model) -> bool {
         && model.connect.is_none()
         && model.pending.is_none()
         && model.info.is_none()
+        && model.msg_menu.is_none()
 }
 
 /// Map a mouse click at absolute `(col, row)` to the transcript entry under it, using the layout
@@ -1911,6 +1931,103 @@ fn entry_at_click(model: &Model, col: u16, row: u16) -> Option<usize> {
         .entry_spans
         .iter()
         .position(|&(start, len)| line_idx >= start && line_idx < start + len)
+}
+
+/// An action offered in the message click-menu.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MsgAction {
+    Copy,
+    Rewind,
+    Delete,
+}
+
+/// The actions available for a given transcript entry (empty → no menu opens).
+fn menu_actions(entry: &Entry) -> Vec<(MsgAction, &'static str)> {
+    match entry {
+        Entry::User(_) => vec![
+            (MsgAction::Rewind, "↩ Rewind & edit"),
+            (MsgAction::Copy, "⧉ Copy"),
+            (MsgAction::Delete, "✕ Delete from here"),
+        ],
+        Entry::Assistant(_) | Entry::Tool { .. } | Entry::System(_) => {
+            vec![(MsgAction::Copy, "⧉ Copy")]
+        }
+        Entry::Turn { .. } => Vec::new(),
+    }
+}
+
+/// The copyable text of a transcript entry, if any.
+fn entry_text(entry: &Entry) -> Option<String> {
+    match entry {
+        Entry::User(s) | Entry::Assistant(s) | Entry::System(s) => Some(s.clone()),
+        Entry::Tool { text, .. } => Some(text.clone()),
+        Entry::Turn { .. } => None,
+    }
+}
+
+/// Which menu row (if any) a click at `(col, row)` lands on, using the rect stashed during render.
+fn menu_item_at(model: &Model, col: u16, row: u16) -> Option<usize> {
+    let (rx, ry, rw, rh) = model.msg_menu_rect?;
+    if col < rx || col >= rx + rw || row <= ry || row >= ry + rh - 1 {
+        return None; // outside, or on the top/bottom border row
+    }
+    let mm = model.msg_menu.as_ref()?;
+    let n = menu_actions(model.transcript.get(mm.entry)?).len();
+    let item = (row - ry - 1) as usize;
+    (item < n).then_some(item)
+}
+
+/// Run the highlighted message-menu action, then close the menu.
+fn run_msg_menu(model: &mut Model, control_tx: &mpsc::UnboundedSender<Control>) {
+    let Some(mm) = model.msg_menu.take() else {
+        return;
+    };
+    let idx = mm.entry;
+    let Some(entry) = model.transcript.get(idx) else {
+        return;
+    };
+    let actions = menu_actions(entry);
+    let Some(&(act, _)) = actions.get(mm.sel) else {
+        return;
+    };
+    // Extract everything owned up front so we can mutate the transcript below.
+    let copy_text = entry_text(entry);
+    let user_text = match entry {
+        Entry::User(t) => t.clone(),
+        _ => String::new(),
+    };
+    match act {
+        MsgAction::Copy => {
+            if let Some(t) = copy_text {
+                copy_osc52(&t);
+                model
+                    .transcript
+                    .push(Entry::System("copied to clipboard".into()));
+            }
+        }
+        MsgAction::Rewind | MsgAction::Delete => {
+            let ordinal = model.transcript[..idx]
+                .iter()
+                .filter(|e| matches!(e, Entry::User(_)))
+                .count();
+            model.transcript.truncate(idx);
+            model.msg_redo.clear();
+            model.scroll = 0;
+            if act == MsgAction::Rewind {
+                model.input = user_text;
+                model.cursor = model.input.len();
+                model.anchor = None;
+                model.transcript.push(Entry::System(
+                    "↩ rewound — edit and press Enter to resend".into(),
+                ));
+            } else {
+                model
+                    .transcript
+                    .push(Entry::System("✕ deleted from here".into()));
+            }
+            let _ = control_tx.send(Control::RewindTo(ordinal));
+        }
+    }
 }
 
 /// Handle a keypress with OpenCode-style keybinds. Editing keys mutate the model directly;
@@ -1993,6 +2110,23 @@ fn handle_key(
     }
     if model.info.is_some() {
         model.info = None;
+        return None;
+    }
+
+    // Message action menu (opened by clicking a message): ↑↓ select, Enter run, Esc close.
+    if let Some(mm) = &mut model.msg_menu {
+        let n = model
+            .transcript
+            .get(mm.entry)
+            .map(|e| menu_actions(e).len())
+            .unwrap_or(0);
+        match code {
+            Esc => model.msg_menu = None,
+            Up => mm.sel = mm.sel.saturating_sub(1),
+            Down => mm.sel = (mm.sel + 1).min(n.saturating_sub(1)),
+            Enter => return Some(KeyAction::MsgMenuExec),
+            _ => {}
+        }
         return None;
     }
 
@@ -3328,6 +3462,11 @@ fn view(f: &mut Frame, model: &mut Model, theme: &Theme) {
     // ---- command palette (ctrl+p): search box + filtered rows -------------------------------
     if model.palette_open {
         render_palette(f, area, model, theme);
+    }
+
+    // ---- message action menu (click a message) ----------------------------------------------
+    if model.msg_menu.is_some() {
+        render_msg_menu(f, area, model, theme);
     }
 
     // ---- permission modal -------------------------------------------------------------------
@@ -4671,6 +4810,69 @@ fn modal_row(
 }
 
 /// The ctrl+p command palette / model picker (OpenCode-style).
+/// The small floating action menu anchored at a clicked message. Also stashes its rect on the
+/// model for click hit-testing (`menu_item_at`).
+fn render_msg_menu(f: &mut Frame, area: Rect, model: &mut Model, theme: &Theme) {
+    let (entry_idx, col, row, sel0) = match &model.msg_menu {
+        Some(mm) => (mm.entry, mm.col, mm.row, mm.sel),
+        None => return,
+    };
+    let actions = match model.transcript.get(entry_idx) {
+        Some(e) => menu_actions(e),
+        None => {
+            model.msg_menu = None;
+            return;
+        }
+    };
+    if actions.is_empty() {
+        model.msg_menu = None;
+        return;
+    }
+    let sel = sel0.min(actions.len() - 1);
+    let label_w = actions
+        .iter()
+        .map(|(_, l)| l.chars().count())
+        .max()
+        .unwrap_or(8);
+    let w = ((label_w + 4) as u16).min(area.width.max(1));
+    let h = (actions.len() as u16 + 2).min(area.height.max(1));
+    let x = col.min(area.x + area.width.saturating_sub(w));
+    let y = row.min(area.y + area.height.saturating_sub(h));
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.surface));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let rows: Vec<Line> = actions
+        .iter()
+        .enumerate()
+        .map(|(i, (_, label))| {
+            let style = if i == sel {
+                Style::default()
+                    .fg(theme.base)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.user).bg(theme.surface)
+            };
+            Line::from(Span::styled(format!(" {label} "), style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(rows), inner);
+    model.msg_menu_rect = Some((rect.x, rect.y, rect.width, rect.height));
+    if let Some(mm) = &mut model.msg_menu {
+        mm.sel = sel;
+    }
+}
+
 fn render_palette(f: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
     let popup = centered_rect(62, 74, area);
     let title = if model.palette_query.starts_with("model") {
