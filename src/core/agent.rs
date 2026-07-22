@@ -117,7 +117,15 @@ impl AgentLoop {
                 temperature: None,
             };
 
-            let stream = self.provider.stream(req).await?;
+            // Race the request establishment against cancellation too, so Esc aborts instantly even
+            // while the request is still hanging before the first byte (TTFT), not only mid-stream.
+            let stream = tokio::select! {
+                s = self.provider.stream(req) => s?,
+                _ = cancel.cancelled() => {
+                    let _ = events.send(AgentEvent::TurnComplete { usage: Usage::default() });
+                    return Ok(());
+                }
+            };
             let tap = events.clone();
             let (assistant, usage) = tokio::select! {
                 r = assemble_with(stream, move |ev| {

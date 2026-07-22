@@ -134,6 +134,8 @@ enum KeyAction {
     OpenProviders,
     /// Delete a saved provider by id (from the manager).
     DeleteProvider(String),
+    /// Paste from the system clipboard: an image is saved + attached as `@image`, else text.
+    PasteClipboard,
 }
 
 /// Permission gate backed by the UI: forwards a request to the event loop and awaits the user's
@@ -512,6 +514,53 @@ fn endpoint_for(kind: &str) -> Option<(String, String)> {
             std::env::var("OPENAI_API_KEY").unwrap_or_default(),
         )),
     }
+}
+
+/// Fetch the live `/models` list for the active endpoint plus every configured provider,
+/// concurrently, and merge into one deduplicated list. This front-loads model discovery so the
+/// picker shows models without first switching to each provider. Degrades to empty per-endpoint.
+async fn fetch_all_models(config: &Config, active_kind: &str, cwd: &std::path::Path) -> Vec<String> {
+    let mut endpoints: Vec<(String, String)> = Vec::new();
+    if let Some((base, key)) = endpoint_for(active_kind) {
+        endpoints.push((base, key));
+    }
+    for p in &config.providers {
+        if p.kind == "anthropic" {
+            continue; // Anthropic has no OpenAI-style /models endpoint
+        }
+        let base = p.base_url.clone().unwrap_or_default();
+        if base.is_empty() {
+            continue;
+        }
+        let key = p
+            .api_key_env
+            .as_ref()
+            .and_then(|e| std::env::var(e).ok())
+            .or_else(|| key_store(cwd).get(&p.name))
+            .unwrap_or_default();
+        endpoints.push((base, key));
+    }
+    // Dedup endpoints by base URL so a provider that shares the active URL isn't fetched twice.
+    endpoints.sort_by(|a, b| a.0.cmp(&b.0));
+    endpoints.dedup_by(|a, b| a.0 == b.0);
+
+    let results = futures::future::join_all(
+        endpoints
+            .into_iter()
+            .map(|(base, key)| async move { list_models(&base, &key).await.unwrap_or_default() }),
+    )
+    .await;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for list in results {
+        for m in list {
+            if seen.insert(m.clone()) {
+                out.push(m);
+            }
+        }
+    }
+    out
 }
 
 /// Resolve a model's price (per million in/out): config override wins, else models.dev.
@@ -981,13 +1030,15 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
     let cache_dir = user_cordy_dir()
         .map(|d| d.join("cache"))
         .unwrap_or_else(|| cwd.join(".cordy/cache"));
-    let live_fut = async {
-        match endpoint_for(&provider_kind) {
-            Some((base, key)) => list_models(&base, &key).await.unwrap_or_default(),
-            None => Vec::new(),
-        }
-    };
-    let (live_models, catalog) = tokio::join!(live_fut, models_dev::load_catalog(&cache_dir));
+    // Fetch every configured provider's live model list up-front (concurrently) so the picker
+    // shows models without first switching to that provider; merge into one deduplicated list.
+    let live_fut = fetch_all_models(&config, &provider_kind, &cwd);
+    let update_fut = crate::core::update::check(&cache_dir);
+    let (live_models, catalog, latest_version) = tokio::join!(
+        live_fut,
+        models_dev::load_catalog(&cache_dir),
+        update_fut
+    );
 
     let palette = build_palette(
         &config,
@@ -1029,8 +1080,15 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
             .clone()
             .filter(|t| THEME_NAMES.contains(&t.as_str()))
             .unwrap_or_else(|| "mono".into()),
+        latest_version,
         ..Default::default()
     };
+    if let Some(v) = &model.latest_version {
+        model.transcript.push(Entry::System(format!(
+            "↑ cordy v{v} is available (you have v{}) — run: cargo install cordy",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
     // No intro line here: an empty transcript shows the splash; the input placeholder + hints
     // already guide first use. Any pushed entry (a message or command output) reveals the log.
     if resumed_count > 0 {
@@ -1112,15 +1170,13 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                         }
                     }
                 }
-                // Bracketed paste: insert clipboard text into the input at the cursor.
+                // Bracketed paste (or a coalesced key-burst): insert at the cursor, collapsing
+                // large blobs to a placeholder. Newlines never submit here.
                 if let Event::Paste(text) = &ev {
-                    for ch in text.chars() {
-                        update(
-                            &mut model,
-                            if ch == '\n' { Msg::Newline } else { Msg::Insert(ch) },
-                        );
-                    }
+                    let text = text.clone();
+                    insert_paste(&mut model, &text);
                     model.suggestions = compute_suggestions(&model.input, &cwd);
+                    model.suggestion_sel = 0;
                 }
                 if let Event::Key(k) = ev
                     && k.kind != KeyEventKind::Release
@@ -1134,6 +1190,7 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                     }
                     match handle_key(&mut model, k, &mut pending_reply) {
                         Some(KeyAction::Prompt(text)) => {
+                            let text = expand_pastes(&mut model, &text);
                             let content = match super::input::parse_user_input(&text, &cwd) {
                                 Ok(blocks) => blocks,
                                 Err(e) => {
@@ -1316,7 +1373,14 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                             {
                                 tok.cancel();
                             }
-                            model.transcript.push(Entry::System("interrupted".into()));
+                            let dropped = model.queue.len();
+                            model.queue.clear();
+                            let note = if dropped > 0 {
+                                format!("interrupted ({dropped} queued message(s) dropped)")
+                            } else {
+                                "interrupted".into()
+                            };
+                            model.transcript.push(Entry::System(note));
                         }
                         Some(KeyAction::NewSession) => {
                             model.transcript.clear();
@@ -1476,10 +1540,29 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                                 let _ = control_tx.send(Control::RedoMessage);
                             }
                         }
+                        Some(KeyAction::PasteClipboard) => {
+                            match paste_clipboard(&mut model, &cwd) {
+                                Ok(Some(msg)) => model.transcript.push(Entry::System(msg)),
+                                Ok(None) => {}
+                                Err(e) => model
+                                    .transcript
+                                    .push(Entry::System(format!("clipboard paste failed: {e}"))),
+                            }
+                            model.suggestions = compute_suggestions(&model.input, &cwd);
+                            model.suggestion_sel = 0;
+                        }
                         None => {}
                     }
-                    // Refresh inline autocomplete suggestions after any input change.
-                    model.suggestions = compute_suggestions(&model.input, &cwd);
+                    // Refresh inline autocomplete suggestions after any input change. Reset the
+                    // highlight to the top only when the candidate set actually changed, so arrow
+                    // navigation (which doesn't edit the input) is preserved.
+                    let next = compute_suggestions(&model.input, &cwd);
+                    if next != model.suggestions {
+                        model.suggestion_sel = 0;
+                    } else if !next.is_empty() {
+                        model.suggestion_sel = model.suggestion_sel.min(next.len() - 1);
+                    }
+                    model.suggestions = next;
                 }
             }
             Some(a) = agent_rx.recv() => {
@@ -1494,6 +1577,24 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                         model: model.model_name.clone(),
                         secs: start.elapsed().as_secs_f64(),
                     });
+                }
+                // Drain one queued message once the turn is idle: feed it through the same submit
+                // path so it appears in the transcript and streams like a normal prompt.
+                if !model.busy && !model.queue.is_empty() {
+                    let text = model.queue.remove(0);
+                    model.input = text;
+                    if let Effect::Submit(t) = update(&mut model, Msg::Submit) {
+                        let t = expand_pastes(&mut model, &t);
+                        let content = match super::input::parse_user_input(&t, &cwd) {
+                            Ok(blocks) => blocks,
+                            Err(e) => {
+                                update(&mut model, Msg::Agent(AgentEvent::Error(e)));
+                                vec![ContentBlock::text(t)]
+                            }
+                        };
+                        turn_start = Some(std::time::Instant::now());
+                        let _ = prompt_tx.send(content);
+                    }
                 }
             }
             Some(ask) = perm_rx.recv() => {
@@ -1561,14 +1662,75 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
     result
 }
 
+/// A plain printable key (no ctrl/alt/super) — the kind of event a terminal without bracketed
+/// paste emits, one per pasted character. Shift is allowed (capitals / shifted symbols).
+fn is_text_key(ev: &Event) -> bool {
+    if let Event::Key(k) = ev {
+        if k.kind == KeyEventKind::Release {
+            return false;
+        }
+        let plain = !k
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        return plain && matches!(k.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab);
+    }
+    false
+}
+
+/// Forward a burst of text keys: 2+ back-to-back keys are a paste (terminals without bracketed
+/// paste), coalesced into one `Event::Paste` so an embedded Enter never submits. A lone key is
+/// forwarded unchanged. Returns `false` if the receiver is gone.
+fn flush_burst(tx: &mpsc::UnboundedSender<Event>, burst: Vec<Event>) -> bool {
+    if burst.len() >= 2 {
+        let mut s = String::new();
+        for ev in &burst {
+            if let Event::Key(k) = ev {
+                match k.code {
+                    KeyCode::Char(c) => s.push(c),
+                    KeyCode::Enter => s.push('\n'),
+                    KeyCode::Tab => s.push('\t'),
+                    _ => {}
+                }
+            }
+        }
+        return tx.send(Event::Paste(s)).is_ok();
+    }
+    for ev in burst {
+        if tx.send(ev).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 fn spawn_input_reader(tx: mpsc::UnboundedSender<Event>) {
     std::thread::spawn(move || {
         loop {
             match event::poll(Duration::from_millis(100)) {
                 Ok(true) => {
-                    if let Ok(ev) = event::read()
-                        && tx.send(ev).is_err()
-                    {
+                    let Ok(ev) = event::read() else { break };
+                    if is_text_key(&ev) {
+                        // Greedily gather immediately-available text keys; a rapid run is a paste.
+                        let mut burst = vec![ev];
+                        let mut trailing = None;
+                        while let Ok(true) = event::poll(Duration::from_millis(0)) {
+                            let Ok(next) = event::read() else { break };
+                            if is_text_key(&next) {
+                                burst.push(next);
+                            } else {
+                                trailing = Some(next);
+                                break;
+                            }
+                        }
+                        if !flush_burst(&tx, burst) {
+                            break;
+                        }
+                        if let Some(t) = trailing
+                            && tx.send(t).is_err()
+                        {
+                            break;
+                        }
+                    } else if tx.send(ev).is_err() {
                         break;
                     }
                 }
@@ -1581,6 +1743,34 @@ fn spawn_input_reader(tx: mpsc::UnboundedSender<Event>) {
             }
         }
     });
+}
+
+/// Map a character to the physical QWERTY key at its position on a Russian ЙЦУКЕН layout, so
+/// keybinds work regardless of the active OS layout. Latin (and unmapped) chars pass through.
+fn latinize(c: char) -> char {
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    let mapped = match lower {
+        'й' => 'q', 'ц' => 'w', 'у' => 'e', 'к' => 'r', 'е' => 't', 'н' => 'y', 'г' => 'u',
+        'ш' => 'i', 'щ' => 'o', 'з' => 'p', 'х' => '[', 'ъ' => ']',
+        'ф' => 'a', 'ы' => 's', 'в' => 'd', 'а' => 'f', 'п' => 'g', 'р' => 'h', 'о' => 'j',
+        'л' => 'k', 'д' => 'l', 'ж' => ';', 'э' => '\'',
+        'я' => 'z', 'ч' => 'x', 'с' => 'c', 'м' => 'v', 'и' => 'b', 'т' => 'n', 'ь' => 'm',
+        'б' => ',', 'ю' => '.', 'ё' => '`',
+        _ => return c,
+    };
+    if c.is_uppercase() {
+        mapped.to_ascii_uppercase()
+    } else {
+        mapped
+    }
+}
+
+/// [`latinize`] lifted over a [`KeyCode`]: translates `Char(..)`, leaves other keys unchanged.
+fn latinize_code(code: KeyCode) -> KeyCode {
+    match code {
+        KeyCode::Char(c) => KeyCode::Char(latinize(c)),
+        other => other,
+    }
 }
 
 /// Handle a keypress with OpenCode-style keybinds. Editing keys mutate the model directly;
@@ -1597,11 +1787,20 @@ fn handle_key(
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt = k.modifiers.contains(KeyModifiers::ALT);
     let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+    // Layout-independent keybinds: on a non-Latin layout (e.g. Cyrillic) crossterm reports the
+    // layout character, so map it back to its physical QWERTY key for SHORTCUT matching. Only done
+    // for modified keys and the leader chord — plain typing keeps the original char (fix below uses
+    // `k.code` in the text-insert arm), so Cyrillic text still types correctly.
+    let code = if ctrl || alt {
+        latinize_code(k.code)
+    } else {
+        k.code
+    };
 
     // Leader chord: resolve the key following ctrl+x (see the which-key overlay for the map).
     if model.leader {
         model.leader = false;
-        return match k.code {
+        return match latinize_code(k.code) {
             Char('q') => {
                 update(model, Msg::Quit);
                 None
@@ -1836,15 +2035,15 @@ fn handle_key(
         return Some(KeyAction::CycleRecent(if shift { -1 } else { 1 }));
     }
     // ctrl+shift+d deletes the current line; plain ctrl+d exits.
-    if ctrl && shift && matches!(k.code, Char('d') | Char('D')) {
+    if ctrl && shift && matches!(code, Char('d') | Char('D')) {
         update(model, Msg::KillLine);
         return None;
     }
-    if ctrl && matches!(k.code, Char('d')) {
+    if ctrl && matches!(code, Char('d')) {
         update(model, Msg::Quit);
         return None;
     }
-    if ctrl && matches!(k.code, Char('c')) {
+    if ctrl && matches!(code, Char('c')) {
         update(
             model,
             if model.input.is_empty() {
@@ -1855,17 +2054,27 @@ fn handle_key(
         );
         return None;
     }
+    // ctrl+v: paste from the system clipboard — an image becomes an attachment, else text.
+    if ctrl && matches!(code, Char('v')) {
+        return Some(KeyAction::PasteClipboard);
+    }
 
-    match k.code {
+    match code {
         Esc => {
+            // Esc dismisses an open autocomplete popup, interrupts a running turn, or does
+            // nothing — it never quits the app (quit: ctrl+c on empty input, ctrl+d, ^X q, /quit).
+            if !model.suggestions.is_empty() {
+                model.suggestions.clear();
+                model.suggestion_sel = 0;
+                return None;
+            }
             if model.busy {
                 return Some(KeyAction::Interrupt);
             }
-            update(model, Msg::Quit);
             None
         }
         Tab => {
-            // Tab completes an autocomplete suggestion if any, else cycles the mode.
+            // Tab completes the highlighted autocomplete suggestion if any, else cycles the mode.
             if !model.suggestions.is_empty() {
                 apply_completion(model);
             } else {
@@ -1887,6 +2096,12 @@ fn handle_key(
             None
         }
         Enter => {
+            // With the autocomplete popup open, Enter accepts the highlighted suggestion instead
+            // of submitting; the next Enter submits.
+            if !model.suggestions.is_empty() {
+                apply_completion(model);
+                return None;
+            }
             let raw = model.input.trim().to_string();
             if raw.starts_with('/') {
                 update(model, Msg::ClearInput);
@@ -1917,9 +2132,13 @@ fn handle_key(
             move_with_sel(model, m, shift);
             None
         }
-        // Up/Down move across logical lines, falling back to prompt history at the edges.
+        // Up/Down: navigate the autocomplete popup if open; else move across wrapped visual lines,
+        // falling back to prompt history only at the top/bottom edge.
         Up => {
-            if super::move_vertical(&model.input, model.cursor, -1).is_some() {
+            let w = model.input_width as usize;
+            if !model.suggestions.is_empty() {
+                model.suggestion_sel = model.suggestion_sel.saturating_sub(1);
+            } else if super::move_vertical(&model.input, model.cursor, -1, w).is_some() {
                 move_with_sel(model, Msg::CursorUp, shift);
             } else {
                 update(model, Msg::HistoryPrev);
@@ -1927,7 +2146,11 @@ fn handle_key(
             None
         }
         Down => {
-            if super::move_vertical(&model.input, model.cursor, 1).is_some() {
+            let w = model.input_width as usize;
+            if !model.suggestions.is_empty() {
+                let last = model.suggestions.len().saturating_sub(1);
+                model.suggestion_sel = (model.suggestion_sel + 1).min(last);
+            } else if super::move_vertical(&model.input, model.cursor, 1, w).is_some() {
                 move_with_sel(model, Msg::CursorDown, shift);
             } else {
                 update(model, Msg::HistoryNext);
@@ -2726,7 +2949,28 @@ fn view(f: &mut Frame, model: &mut Model, theme: &Theme) {
     }
 
     // ---- input box (left-accent bar + prompt + mode line) -----------------------------------
+    // Text columns available per input row (excludes borders/padding + the 2-col prompt gutter);
+    // drives wrapped-line cursor navigation. Keep in sync with the input block's Padding below.
+    model.input_width = chunks[1].width.saturating_sub(6).max(8);
     let mut input_content = build_input_lines(model, theme);
+    // Queued messages (typed while busy) shown above the prompt, dispatched in order on turn end.
+    if !model.queue.is_empty() {
+        let mut q: Vec<Line> = model
+            .queue
+            .iter()
+            .map(|m| {
+                let preview: String = m.chars().take(60).collect();
+                let ell = if m.chars().count() > 60 { "…" } else { "" };
+                Line::from(Span::styled(
+                    format!("⧗ queued: {preview}{ell}"),
+                    Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
+                ))
+            })
+            .collect();
+        q.push(Line::raw(""));
+        q.extend(input_content);
+        input_content = q;
+    }
     let mode_style = if model.mode_flash > 0 {
         Style::default()
             .fg(theme.accent)
@@ -2781,7 +3025,7 @@ fn view(f: &mut Frame, model: &mut Model, theme: &Theme) {
             .iter()
             .take(n)
             .enumerate()
-            .map(|(i, s)| modal_row(iw, "", s, slash_desc(s), "", i == 0, theme))
+            .map(|(i, s)| modal_row(iw, "", s, slash_desc(s), "", i == model.suggestion_sel, theme))
             .collect();
         f.render_widget(Paragraph::new(rows), inner);
     }
@@ -3481,9 +3725,111 @@ fn file_suggestions(cwd: &std::path::Path, partial: &str) -> Vec<String> {
     out
 }
 
-/// Replace the current token with the top autocomplete suggestion.
+/// Pastes at/above this many characters are collapsed to a `[pasted N chars]` placeholder.
+const PASTE_COLLAPSE_MIN: usize = 300;
+
+/// Insert pasted `text` into the input. Line endings are normalized (CRLF / lone CR → `\n`, kept as
+/// newlines, never a submit). A large paste is stashed and replaced by a `[#id pasted N chars]`
+/// placeholder that `expand_pastes` re-inflates on submit.
+fn insert_paste(model: &mut Model, text: &str) {
+    let norm = text.replace("\r\n", "\n").replace('\r', "\n");
+    let count = norm.chars().count();
+    if count >= PASTE_COLLAPSE_MIN {
+        let id = model.paste_seq;
+        model.paste_seq = model.paste_seq.wrapping_add(1);
+        let token = format!("[#{id} pasted {count} chars]");
+        model.pastes.insert(id, norm);
+        for ch in token.chars() {
+            update(model, Msg::Insert(ch));
+        }
+    } else {
+        for ch in norm.chars() {
+            update(
+                model,
+                if ch == '\n' { Msg::Newline } else { Msg::Insert(ch) },
+            );
+        }
+    }
+}
+
+/// Replace every `[#id pasted N chars]` placeholder in `text` with its stashed blob, consuming the
+/// entries from `model.pastes`. Called on submit so the model receives the full pasted content.
+fn expand_pastes(model: &mut Model, text: &str) -> String {
+    if !text.contains("[#") || model.pastes.is_empty() {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    let ids: Vec<u32> = model.pastes.keys().copied().collect();
+    for id in ids {
+        // Match the exact token shape produced by `insert_paste` for this id.
+        if let Some(blob) = model.pastes.get(&id) {
+            let count = blob.chars().count();
+            let token = format!("[#{id} pasted {count} chars]");
+            if out.contains(&token) {
+                let blob = model.pastes.remove(&id).unwrap();
+                out = out.replace(&token, &blob);
+            }
+        }
+    }
+    out
+}
+
+/// Paste from the system clipboard. An image is encoded to PNG under `~/.cordy/cache/pasted/` and a
+/// ` @image <path>` token is appended to the input (reusing the existing vision pipeline);
+/// otherwise clipboard text is inserted via [`insert_paste`]. Returns a status line to surface.
+fn paste_clipboard(
+    model: &mut Model,
+    cwd: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
+    let mut cb = arboard::Clipboard::new()?;
+    // Prefer an image when the clipboard holds one.
+    if let Ok(img) = cb.get_image() {
+        let dir = user_cordy_dir()
+            .map(|d| d.join("cache/pasted"))
+            .unwrap_or_else(|| cwd.join(".cordy/cache/pasted"));
+        std::fs::create_dir_all(&dir)?;
+        let id = model.paste_seq;
+        model.paste_seq = model.paste_seq.wrapping_add(1);
+        let path = dir.join(format!("clip-{id}.png"));
+        write_png(&path, img.width, img.height, &img.bytes)?;
+        let token = format!(" @image {}", path.display());
+        for ch in token.chars() {
+            update(model, Msg::Insert(ch));
+        }
+        return Ok(Some(format!(
+            "📎 image attached ({}×{}) — send to include it",
+            img.width, img.height
+        )));
+    }
+    // No image — fall back to clipboard text.
+    match cb.get_text() {
+        Ok(text) if !text.is_empty() => {
+            insert_paste(model, &text);
+            Ok(None)
+        }
+        _ => Ok(Some("clipboard is empty".into())),
+    }
+}
+
+/// Write RGBA8 pixels to a PNG file.
+fn write_png(
+    path: &std::path::Path,
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+) -> anyhow::Result<()> {
+    let file = std::fs::File::create(path)?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()?.write_image_data(rgba)?;
+    Ok(())
+}
+
+/// Replace the current token with the highlighted autocomplete suggestion.
 fn apply_completion(model: &mut Model) {
-    let Some(first) = model.suggestions.first().cloned() else {
+    let sel = model.suggestion_sel.min(model.suggestions.len().saturating_sub(1));
+    let Some(first) = model.suggestions.get(sel).cloned() else {
         return;
     };
     if model.input.starts_with('/') && !model.input.contains(char::is_whitespace) {
@@ -3532,9 +3878,16 @@ fn build_input_lines(model: &Model, theme: &Theme) -> Vec<Line<'static>> {
     };
 
     // Render char by char (by byte offset) so the cursor block and the selection highlight land
-    // exactly, across logical lines.
+    // exactly, across logical lines and wrapped visual rows. Wrapping mirrors `visual_rows` in the
+    // model (hard wrap every `input_width` chars) so ↑/↓ cursor motion matches what's drawn.
+    let width = if model.input_width == 0 {
+        usize::MAX
+    } else {
+        model.input_width as usize
+    };
     let mut out: Vec<Line> = Vec::new();
     let mut row = 0usize;
+    let mut col = 0usize;
     let mut spans = vec![prompt(0)];
     for (i, ch) in model.input.char_indices() {
         if ch == '\n' {
@@ -3543,8 +3896,15 @@ fn build_input_lines(model: &Model, theme: &Theme) -> Vec<Line<'static>> {
             }
             out.push(Line::from(std::mem::take(&mut spans)));
             row += 1;
+            col = 0;
             spans.push(prompt(row));
             continue;
+        }
+        if col == width {
+            out.push(Line::from(std::mem::take(&mut spans)));
+            row += 1;
+            col = 0;
+            spans.push(prompt(row));
         }
         let in_sel = sel.is_some_and(|(s, e)| i >= s && i < e);
         let style = if i == cur && blink_on {
@@ -3555,6 +3915,7 @@ fn build_input_lines(model: &Model, theme: &Theme) -> Vec<Line<'static>> {
             Style::default()
         };
         spans.push(Span::styled(ch.to_string(), style));
+        col += 1;
     }
     if cur == model.input.len() && blink_on {
         spans.push(Span::styled(" ", cursor_style));
@@ -3718,16 +4079,25 @@ fn render_side_panel(f: &mut Frame, area: Rect, model: &Model, theme: &Theme) {
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows[0]);
 
-    // Bottom: cwd + version.
+    // Bottom: cwd + version (+ an update badge when a newer release is available).
+    let mut version_spans = vec![
+        Span::styled("• ", Style::default().fg(theme.accent)),
+        Span::styled(
+            format!("cordy v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(theme.user).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(v) = &model.latest_version {
+        version_spans.push(Span::styled(
+            format!("  ↑ v{v}"),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     let footer = vec![
         Line::from(Span::styled(model.footer.clone(), dim)),
-        Line::from(vec![
-            Span::styled("• ", Style::default().fg(theme.accent)),
-            Span::styled(
-                format!("cordy v{}", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(theme.user).add_modifier(Modifier::BOLD),
-            ),
-        ]),
+        Line::from(version_spans),
     ];
     f.render_widget(Paragraph::new(footer), rows[1]);
 }

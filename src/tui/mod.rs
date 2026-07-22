@@ -171,6 +171,20 @@ pub struct Model {
     pub mcp_names: Vec<(String, String)>,
     /// Inline input autocomplete candidates (slash commands / `@` file paths).
     pub suggestions: Vec<String>,
+    /// Highlighted row within `suggestions` (navigated with ↑/↓ while the popup is open).
+    pub suggestion_sel: usize,
+    /// Messages typed while the agent was busy, sent in order once the turn completes.
+    pub queue: Vec<String>,
+    /// Draft stashed when browsing history with ↑, restored when stepping back past the newest.
+    pub history_draft: Option<(String, usize)>,
+    /// Large pastes collapsed to `[pasted N chars]` placeholders; expanded on submit. Indexed by
+    /// the id embedded in the placeholder token.
+    pub pastes: std::collections::HashMap<u32, String>,
+    /// Monotonic id source for `pastes`.
+    pub paste_seq: u32,
+    /// Text columns available for one input row (excludes the prompt gutter); set during render
+    /// so cursor navigation can follow wrapped visual lines.
+    pub input_width: u16,
     /// Submitted-prompt history (newest last) and the browse cursor while pressing ↑/↓.
     pub history: Vec<String>,
     pub history_idx: Option<usize>,
@@ -201,6 +215,8 @@ pub struct Model {
     /// User-customizable status-line template (placeholders like `{model}`, `{ctx}`, `{cost}`).
     /// `None` uses the built-in default layout.
     pub statusline: Option<String>,
+    /// A newer published Cordy version, if the startup update check found one.
+    pub latest_version: Option<String>,
 }
 
 impl Model {
@@ -401,13 +417,14 @@ pub fn update(model: &mut Model, msg: Msg) -> Effect {
             Effect::None
         }
         Msg::CursorUp => {
-            if let Some(c) = move_vertical(&model.input, model.cursor, -1) {
+            if let Some(c) = move_vertical(&model.input, model.cursor, -1, model.input_width as usize)
+            {
                 model.cursor = c;
             }
             Effect::None
         }
         Msg::CursorDown => {
-            if let Some(c) = move_vertical(&model.input, model.cursor, 1) {
+            if let Some(c) = move_vertical(&model.input, model.cursor, 1, model.input_width as usize) {
                 model.cursor = c;
             }
             Effect::None
@@ -515,12 +532,21 @@ pub fn update(model: &mut Model, msg: Msg) -> Effect {
             Effect::None
         }
         Msg::Submit => {
-            if model.busy || model.input.trim().is_empty() {
+            if model.input.trim().is_empty() {
                 return Effect::None;
             }
             let text = std::mem::take(&mut model.input);
             model.cursor = 0;
             model.anchor = None;
+            model.history_draft = None;
+            // Busy: hold the message in the queue; it is dispatched when the turn completes. The
+            // queue is shown above the prompt (see the input view) rather than the transcript, so
+            // the message appears in-line only once it actually starts processing.
+            if model.busy {
+                model.queue.push(text);
+                model.history_idx = None;
+                return Effect::None;
+            }
             if model.history.last().map(String::as_str) != Some(text.as_str()) {
                 model.history.push(text.clone());
             }
@@ -590,14 +616,18 @@ fn push_undo(model: &mut Model) {
     model.history_idx = None;
 }
 
-/// Replace the input with the previous history entry (saving nothing; the current draft is the
-/// most recent unsent text, kept when browsing past the end).
+/// Replace the input with the previous history entry. The live draft is stashed on the first
+/// step into history so stepping back past the newest entry restores it verbatim.
 fn history_prev(model: &mut Model) {
     if model.history.is_empty() {
         return;
     }
     let idx = match model.history_idx {
-        None => model.history.len() - 1,
+        None => {
+            // Entering history from a live draft — remember it (text + cursor) to restore later.
+            model.history_draft = Some((model.input.clone(), model.cursor));
+            model.history.len() - 1
+        }
         Some(0) => 0,
         Some(i) => i - 1,
     };
@@ -606,7 +636,7 @@ fn history_prev(model: &mut Model) {
     model.cursor = model.input.len();
 }
 
-/// Move forward through history; stepping past the newest entry restores an empty draft.
+/// Move forward through history; stepping past the newest entry restores the stashed draft.
 fn history_next(model: &mut Model) {
     match model.history_idx {
         Some(i) if i + 1 < model.history.len() => {
@@ -616,8 +646,9 @@ fn history_next(model: &mut Model) {
         }
         Some(_) => {
             model.history_idx = None;
-            model.input.clear();
-            model.cursor = 0;
+            let (text, cur) = model.history_draft.take().unwrap_or_default();
+            model.cursor = cur.min(text.len());
+            model.input = text;
         }
         None => {}
     }
@@ -635,17 +666,6 @@ fn line_ranges(s: &str) -> Vec<(usize, usize)> {
     }
     v.push((start, s.len()));
     v
-}
-
-/// (row, column-in-chars) of the cursor within the logical lines of `s`.
-fn row_col(s: &str, cursor: usize) -> (usize, usize) {
-    let ranges = line_ranges(s);
-    for (r, (a, b)) in ranges.iter().enumerate() {
-        if cursor <= *b {
-            return (r, s[*a..cursor].chars().count());
-        }
-    }
-    (ranges.len().saturating_sub(1), 0)
 }
 
 /// The byte range of the logical line containing `cursor`.
@@ -669,23 +689,58 @@ fn line_end(s: &str, cursor: usize) -> usize {
     current_line_range(s, cursor).1
 }
 
-/// Move the cursor vertically by `dir` (−1 up / +1 down), preserving the character column.
-/// Returns `None` when there is no line in that direction (caller may fall back to history).
-fn move_vertical(s: &str, cursor: usize, dir: i32) -> Option<usize> {
-    let ranges = line_ranges(s);
-    let (row, col) = row_col(s, cursor);
-    let target = row as i32 + dir;
-    if target < 0 || target as usize >= ranges.len() {
-        return None;
+/// Visual rows of `s` hard-wrapped at `width` characters, as byte ranges `(start, end)`. Each
+/// logical line yields at least one row; an over-long line splits every `width` chars. `width == 0`
+/// disables wrapping (one row per logical line).
+fn visual_rows(s: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = if width == 0 { usize::MAX } else { width };
+    let mut rows = Vec::new();
+    for (a, b) in line_ranges(s) {
+        let mut chunk_start = a;
+        let mut count = 0usize;
+        let mut pos = a;
+        for ch in s[a..b].chars() {
+            if count == width {
+                rows.push((chunk_start, pos));
+                chunk_start = pos;
+                count = 0;
+            }
+            pos += ch.len_utf8();
+            count += 1;
+        }
+        rows.push((chunk_start, pos)); // trailing (possibly empty) remainder
     }
-    let (a, b) = ranges[target as usize];
-    let line = &s[a..b];
-    for (n, (idx, _)) in line.char_indices().enumerate() {
-        if n == col {
-            return Some(a + idx);
+    rows
+}
+
+/// The (visual row, column-in-chars) of `cursor` within the wrapped rows of `s`.
+fn visual_row_col(rows: &[(usize, usize)], s: &str, cursor: usize) -> (usize, usize) {
+    for (r, &(a, b)) in rows.iter().enumerate() {
+        if cursor <= b {
+            return (r, s[a..cursor].chars().count());
         }
     }
-    Some(b) // column past line end → clamp to end
+    (rows.len().saturating_sub(1), 0)
+}
+
+/// Move the cursor vertically by `dir` (−1 up / +1 down) across wrapped visual rows, preserving the
+/// column. Returns `None` at the top/bottom visual row (caller may fall back to history).
+fn move_vertical(s: &str, cursor: usize, dir: i32, width: usize) -> Option<usize> {
+    let rows = visual_rows(s, width);
+    let (row, col) = visual_row_col(&rows, s, cursor);
+    let target = row as i32 + dir;
+    if target < 0 || target as usize >= rows.len() {
+        return None;
+    }
+    let (a, b) = rows[target as usize];
+    let mut pos = a;
+    for (n, ch) in s[a..b].chars().enumerate() {
+        if n == col {
+            return Some(pos);
+        }
+        pos += ch.len_utf8();
+    }
+    Some(b) // column past the row end → clamp to end
 }
 
 /// Next word boundary after byte index `i` (skip whitespace, then the word).
@@ -997,7 +1052,45 @@ mod tests {
         assert_eq!(m.cursor, 6); // clamped to end of "de"
         // no line above the first → cursor unchanged, caller falls back to history
         update(&mut m, Msg::Home);
-        assert!(move_vertical(&m.input, m.cursor, -1).is_none());
+        assert!(move_vertical(&m.input, m.cursor, -1, 0).is_none());
+    }
+
+    #[test]
+    fn vertical_move_follows_wrapped_visual_rows() {
+        // A single logical line longer than the width wraps into visual rows; Up must move to the
+        // row above (not fall through to history) until the top visual row.
+        let m = typed("abcdefghij"); // 10 chars, width 4 → rows "abcd" "efgh" "ij"
+        // cursor at 9 (before 'j'), visual row 2 col 1. Up → row 1 col 1 = byte 5.
+        assert_eq!(move_vertical(&m.input, 9, -1, 4), Some(5));
+        // row 1 → row 0 col 1 = byte 1.
+        assert_eq!(move_vertical(&m.input, 5, -1, 4), Some(1));
+        // top visual row → None (caller falls back to history).
+        assert_eq!(move_vertical(&m.input, 1, -1, 4), None);
+        // Down from the top row returns to row 1.
+        assert_eq!(move_vertical(&m.input, 1, 1, 4), Some(5));
+    }
+
+    #[test]
+    fn history_down_restores_draft() {
+        let mut m = typed("my draft");
+        m.history.push("older msg".into());
+        // Up enters history, stashing the draft.
+        update(&mut m, Msg::HistoryPrev);
+        assert_eq!(m.input, "older msg");
+        // Down past the newest restores the draft verbatim (with cursor).
+        update(&mut m, Msg::HistoryNext);
+        assert_eq!(m.input, "my draft");
+        assert_eq!(m.cursor, "my draft".len());
+    }
+
+    #[test]
+    fn busy_submit_queues_message() {
+        let mut m = typed("second");
+        m.busy = true;
+        let eff = update(&mut m, Msg::Submit);
+        assert_eq!(eff, Effect::None);
+        assert_eq!(m.queue, vec!["second".to_string()]);
+        assert!(m.input.is_empty());
     }
 
     #[test]

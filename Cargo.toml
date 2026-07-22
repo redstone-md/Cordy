@@ -1,6 +1,6 @@
 [package]
 name = "cordy"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A cross-platform TUI coding agent in Rust — hot-swap any model/provider mid-conversation, MCP, skills, sub-agents, background jobs, and an OpenCode-inspired interface."
@@ -14,6 +14,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.104"
+arboard = "3.4"
 async-trait = "0.1.91"
 base64 = "0.22.1"
 bytes = "1.12.1"
@@ -22,8 +23,10 @@ eventsource-stream = "0.2.3"
 futures = "0.3.33"
 getrandom = "0.4.3"
 ignore = "0.4.31"
+png = "0.17.13"
 ratatui = "0.30.2"
 regex = "1.13.1"
+semver = "1.0.23"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls", "charset", "http2"] }
 rmcp = { version = "2.2.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -11,3 +11,4 @@ pub mod permission;
 pub mod prompt;
 pub mod session_store;
 pub mod types;
+pub mod update;
