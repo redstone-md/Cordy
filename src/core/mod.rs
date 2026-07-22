@@ -10,5 +10,6 @@ pub mod models_dev;
 pub mod permission;
 pub mod prompt;
 pub mod session_store;
+pub mod toolcall_text;
 pub mod types;
 pub mod update;

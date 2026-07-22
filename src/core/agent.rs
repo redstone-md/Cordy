@@ -148,6 +148,18 @@ impl AgentLoop {
             };
 
             session.total_usage = add_usage(session.total_usage, usage);
+
+            // Some models (Gemma, Qwen/Hermes-style, and endpoints that render tool calls as text)
+            // don't populate the structured `tool_calls` field — recover any text-encoded calls so
+            // they execute normally. Only runs when the provider produced no structured tool call.
+            let mut assistant = assistant;
+            let has_structured = assistant
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+            if !has_structured {
+                crate::core::toolcall_text::recover_text_tool_calls(&mut assistant);
+            }
             session.messages.push(assistant.clone());
 
             let tool_uses: Vec<(String, String, Value)> = assistant

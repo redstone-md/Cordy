@@ -11,6 +11,16 @@ all four API families, builtin toolset with a native output optimizer, backgroun
 skills, sub-agents, autonomous ralph-loop, session persistence, permission rules, eight themes,
 and config hot-reload.
 
+## [0.1.6]
+
+### Added
+- **Text-encoded tool calls are recovered** — models that emit tool calls as plain text instead of
+  the structured `tool_calls` field (Gemma, Qwen/Hermes-style, and OpenAI-compatible endpoints that
+  render calls via their chat template) now work. Recognized formats: `<tool_call>{json}</tool_call>`
+  (and the `<|tool_call> … <tool_call|>` and `[TOOL_CALL]` variants), the `call:NAME{key:<|">v<|">}`
+  DSL, and ```` ```tool_code ```` Python-style calls. Only runs when the provider returned no
+  structured call, so native function-calling is untouched.
+
 ## [0.1.5]
 
 ### Added
@@ -99,7 +109,8 @@ Input, provider, and reliability fixes.
 - **Update notification** — on startup Cordy checks crates.io (GitHub releases fallback) and, if a
   newer version is out, shows a notice and a footer badge.
 
-[Unreleased]: https://github.com/redstone-md/Cordy/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/redstone-md/Cordy/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/redstone-md/Cordy/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/redstone-md/Cordy/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/redstone-md/Cordy/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/redstone-md/Cordy/compare/v0.1.2...v0.1.3
