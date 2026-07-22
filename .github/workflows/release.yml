@@ -110,3 +110,21 @@ jobs:
             artifacts/SHA256SUMS.sig
             artifacts/SHA256SUMS.pem
           fail_on_unmatched_files: true
+
+  crates:
+    name: publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the tag matches Cargo.toml
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          echo "tag=$tag  crate=$ver"
+          [ "$tag" = "$ver" ] || { echo "::error::tag v$tag does not match Cargo.toml version $ver"; exit 1; }
+      - name: cargo publish
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
