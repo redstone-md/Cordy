@@ -1,0 +1,14 @@
+# Rust build output
+/target
+
+# Cordy runtime state (sessions, cache, goal/progress, local config)
+/.cordy
+.continuum/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
