@@ -519,7 +519,11 @@ fn endpoint_for(kind: &str) -> Option<(String, String)> {
 /// Fetch the live `/models` list for the active endpoint plus every configured provider,
 /// concurrently, and merge into one deduplicated list. This front-loads model discovery so the
 /// picker shows models without first switching to each provider. Degrades to empty per-endpoint.
-async fn fetch_all_models(config: &Config, active_kind: &str, cwd: &std::path::Path) -> Vec<String> {
+async fn fetch_all_models(
+    config: &Config,
+    active_kind: &str,
+    cwd: &std::path::Path,
+) -> Vec<String> {
     let mut endpoints: Vec<(String, String)> = Vec::new();
     if let Some((base, key)) = endpoint_for(active_kind) {
         endpoints.push((base, key));
@@ -1034,11 +1038,8 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
     // shows models without first switching to that provider; merge into one deduplicated list.
     let live_fut = fetch_all_models(&config, &provider_kind, &cwd);
     let update_fut = crate::core::update::check(&cache_dir);
-    let (live_models, catalog, latest_version) = tokio::join!(
-        live_fut,
-        models_dev::load_catalog(&cache_dir),
-        update_fut
-    );
+    let (live_models, catalog, latest_version) =
+        tokio::join!(live_fut, models_dev::load_catalog(&cache_dir), update_fut);
 
     let palette = build_palette(
         &config,
@@ -1750,12 +1751,39 @@ fn spawn_input_reader(tx: mpsc::UnboundedSender<Event>) {
 fn latinize(c: char) -> char {
     let lower = c.to_lowercase().next().unwrap_or(c);
     let mapped = match lower {
-        'й' => 'q', 'ц' => 'w', 'у' => 'e', 'к' => 'r', 'е' => 't', 'н' => 'y', 'г' => 'u',
-        'ш' => 'i', 'щ' => 'o', 'з' => 'p', 'х' => '[', 'ъ' => ']',
-        'ф' => 'a', 'ы' => 's', 'в' => 'd', 'а' => 'f', 'п' => 'g', 'р' => 'h', 'о' => 'j',
-        'л' => 'k', 'д' => 'l', 'ж' => ';', 'э' => '\'',
-        'я' => 'z', 'ч' => 'x', 'с' => 'c', 'м' => 'v', 'и' => 'b', 'т' => 'n', 'ь' => 'm',
-        'б' => ',', 'ю' => '.', 'ё' => '`',
+        'й' => 'q',
+        'ц' => 'w',
+        'у' => 'e',
+        'к' => 'r',
+        'е' => 't',
+        'н' => 'y',
+        'г' => 'u',
+        'ш' => 'i',
+        'щ' => 'o',
+        'з' => 'p',
+        'х' => '[',
+        'ъ' => ']',
+        'ф' => 'a',
+        'ы' => 's',
+        'в' => 'd',
+        'а' => 'f',
+        'п' => 'g',
+        'р' => 'h',
+        'о' => 'j',
+        'л' => 'k',
+        'д' => 'l',
+        'ж' => ';',
+        'э' => '\'',
+        'я' => 'z',
+        'ч' => 'x',
+        'с' => 'c',
+        'м' => 'v',
+        'и' => 'b',
+        'т' => 'n',
+        'ь' => 'm',
+        'б' => ',',
+        'ю' => '.',
+        'ё' => '`',
         _ => return c,
     };
     if c.is_uppercase() {
@@ -2963,7 +2991,9 @@ fn view(f: &mut Frame, model: &mut Model, theme: &Theme) {
                 let ell = if m.chars().count() > 60 { "…" } else { "" };
                 Line::from(Span::styled(
                     format!("⧗ queued: {preview}{ell}"),
-                    Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(theme.dim)
+                        .add_modifier(Modifier::ITALIC),
                 ))
             })
             .collect();
@@ -3025,7 +3055,17 @@ fn view(f: &mut Frame, model: &mut Model, theme: &Theme) {
             .iter()
             .take(n)
             .enumerate()
-            .map(|(i, s)| modal_row(iw, "", s, slash_desc(s), "", i == model.suggestion_sel, theme))
+            .map(|(i, s)| {
+                modal_row(
+                    iw,
+                    "",
+                    s,
+                    slash_desc(s),
+                    "",
+                    i == model.suggestion_sel,
+                    theme,
+                )
+            })
             .collect();
         f.render_widget(Paragraph::new(rows), inner);
     }
@@ -3746,7 +3786,11 @@ fn insert_paste(model: &mut Model, text: &str) {
         for ch in norm.chars() {
             update(
                 model,
-                if ch == '\n' { Msg::Newline } else { Msg::Insert(ch) },
+                if ch == '\n' {
+                    Msg::Newline
+                } else {
+                    Msg::Insert(ch)
+                },
             );
         }
     }
@@ -3777,10 +3821,7 @@ fn expand_pastes(model: &mut Model, text: &str) -> String {
 /// Paste from the system clipboard. An image is encoded to PNG under `~/.cordy/cache/pasted/` and a
 /// ` @image <path>` token is appended to the input (reusing the existing vision pipeline);
 /// otherwise clipboard text is inserted via [`insert_paste`]. Returns a status line to surface.
-fn paste_clipboard(
-    model: &mut Model,
-    cwd: &std::path::Path,
-) -> anyhow::Result<Option<String>> {
+fn paste_clipboard(model: &mut Model, cwd: &std::path::Path) -> anyhow::Result<Option<String>> {
     let mut cb = arboard::Clipboard::new()?;
     // Prefer an image when the clipboard holds one.
     if let Ok(img) = cb.get_image() {
@@ -3828,7 +3869,9 @@ fn write_png(
 
 /// Replace the current token with the highlighted autocomplete suggestion.
 fn apply_completion(model: &mut Model) {
-    let sel = model.suggestion_sel.min(model.suggestions.len().saturating_sub(1));
+    let sel = model
+        .suggestion_sel
+        .min(model.suggestions.len().saturating_sub(1));
     let Some(first) = model.suggestions.get(sel).cloned() else {
         return;
     };

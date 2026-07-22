@@ -417,14 +417,17 @@ pub fn update(model: &mut Model, msg: Msg) -> Effect {
             Effect::None
         }
         Msg::CursorUp => {
-            if let Some(c) = move_vertical(&model.input, model.cursor, -1, model.input_width as usize)
+            if let Some(c) =
+                move_vertical(&model.input, model.cursor, -1, model.input_width as usize)
             {
                 model.cursor = c;
             }
             Effect::None
         }
         Msg::CursorDown => {
-            if let Some(c) = move_vertical(&model.input, model.cursor, 1, model.input_width as usize) {
+            if let Some(c) =
+                move_vertical(&model.input, model.cursor, 1, model.input_width as usize)
+            {
                 model.cursor = c;
             }
             Effect::None
