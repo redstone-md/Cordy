@@ -127,7 +127,7 @@ impl Anthropic {
     }
 
     fn to_wire(&self, req: &ChatRequest) -> Value {
-        let messages: Vec<Value> = req.messages.iter().filter_map(render_message).collect();
+        let messages = coalesce_roles(req.messages.iter().filter_map(render_message).collect());
         let model = if req.model.is_empty() {
             &self.model
         } else {
@@ -191,6 +191,33 @@ impl Provider for Anthropic {
             native_context_mgmt: true, // context editing (beta header) available
         }
     }
+}
+
+/// Merge adjacent wire messages that share a role.
+///
+/// The Messages API wants strictly alternating roles, but the canonical history can legitimately
+/// produce two user-role messages in a row — a tool-result message followed by an injected
+/// steering message, for instance. Concatenating their content blocks preserves both.
+fn coalesce_roles(messages: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let same_role = out
+            .last()
+            .and_then(|prev: &Value| prev.get("role"))
+            .is_some_and(|role| Some(role) == msg.get("role"));
+        if same_role
+            && let Some(prev) = out.last_mut()
+            && let (Some(prev_blocks), Some(blocks)) = (
+                prev.get_mut("content").and_then(Value::as_array_mut),
+                msg.get("content").and_then(Value::as_array),
+            )
+        {
+            prev_blocks.extend(blocks.iter().cloned());
+            continue;
+        }
+        out.push(msg);
+    }
+    out
 }
 
 fn render_message(m: &Message) -> Option<Value> {

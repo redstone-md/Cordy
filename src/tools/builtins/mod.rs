@@ -3,12 +3,15 @@
 use std::sync::Arc;
 
 use crate::core::capability::CapabilitySource;
+use crate::core::goal::runtime::GoalRuntime;
 use crate::tools::Tool;
 use crate::tools::optimize::Optimizer;
 
+mod apply_patch;
 mod bash;
 mod edit;
 mod glob;
+mod goal;
 mod grep;
 mod ls;
 mod multiedit;
@@ -19,9 +22,11 @@ mod todo;
 mod web;
 mod write;
 
+pub use apply_patch::ApplyPatch;
 pub use bash::Bash;
 pub use edit::Edit;
 pub use glob::Glob;
+pub use goal::{CreateGoal, GetGoal, UpdateGoal};
 pub use grep::Grep;
 pub use ls::Ls;
 pub use multiedit::MultiEdit;
@@ -38,6 +43,8 @@ pub use write::Write;
 pub struct BuiltinTools {
     optimizer: Arc<Optimizer>,
     bg: BgRegistry,
+    /// When present, the goal tools are advertised and wired to this runtime.
+    goal: Option<Arc<GoalRuntime>>,
 }
 
 impl BuiltinTools {
@@ -48,16 +55,27 @@ impl BuiltinTools {
     /// Construct with a shared [`BgRegistry`] so the caller (the TUI) can also observe background
     /// jobs (e.g. for the status bar).
     pub fn with_bg(optimizer: Arc<Optimizer>, bg: BgRegistry) -> Self {
-        BuiltinTools { optimizer, bg }
+        BuiltinTools {
+            optimizer,
+            bg,
+            goal: None,
+        }
+    }
+
+    /// Advertise `get_goal` / `create_goal` / `update_goal` backed by `goal`.
+    pub fn with_goal(mut self, goal: Arc<GoalRuntime>) -> Self {
+        self.goal = Some(goal);
+        self
     }
 }
 
 impl CapabilitySource for BuiltinTools {
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        vec![
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(Read),
             Arc::new(Write),
             Arc::new(Edit),
+            Arc::new(ApplyPatch),
             Arc::new(MultiEdit),
             Arc::new(Grep),
             Arc::new(Glob),
@@ -68,7 +86,13 @@ impl CapabilitySource for BuiltinTools {
             Arc::new(WebFetch),
             Arc::new(Bash::new(self.optimizer.clone(), self.bg.clone())),
             Arc::new(Process::new(self.bg.clone())),
-        ]
+        ];
+        if let Some(goal) = &self.goal {
+            tools.push(Arc::new(GetGoal::new(goal.clone())));
+            tools.push(Arc::new(CreateGoal::new(goal.clone())));
+            tools.push(Arc::new(UpdateGoal::new(goal.clone())));
+        }
+        tools
     }
 }
 

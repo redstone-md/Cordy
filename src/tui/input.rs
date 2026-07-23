@@ -20,11 +20,96 @@ pub enum Command {
     Compact,
     /// `/model [name]` — switch model (None just lists / shows current).
     Model(Option<String>),
-    /// `/goal <text>` — set the autonomous north-star.
-    Goal(String),
-    /// `/ralph` — run the autonomous ralph-loop toward the current goal.
-    Ralph,
+    /// `/goal [...]` — inspect or drive the session goal.
+    Goal(GoalCmd),
     Unknown(String),
+}
+
+/// What `/goal` was asked to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GoalCmd {
+    /// Bare `/goal` — show the current goal and its usage.
+    Show,
+    /// `/goal <objective> [--budget N] [--cost N] [--turns N]` — set the objective and start work.
+    Set {
+        objective: String,
+        limits: GoalLimitArgs,
+    },
+    /// `/goal edit` — reopen the objective in the composer.
+    Edit,
+    Pause,
+    Resume,
+    Clear,
+}
+
+/// Caps parsed off a `/goal` line. `None` means "leave as-is".
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GoalLimitArgs {
+    pub token_budget: Option<i64>,
+    pub cost_cap_usd: Option<f64>,
+    pub max_iterations: Option<u32>,
+}
+
+impl GoalLimitArgs {
+    pub fn is_empty(&self) -> bool {
+        self.token_budget.is_none() && self.cost_cap_usd.is_none() && self.max_iterations.is_none()
+    }
+}
+
+/// Split `--budget/--cost/--turns` flags out of a `/goal` argument, returning the objective text
+/// and the caps. Unparsable values are left in the objective rather than silently dropped.
+fn parse_goal_args(arg: &str) -> (String, GoalLimitArgs) {
+    let mut limits = GoalLimitArgs::default();
+    let mut words: Vec<&str> = Vec::new();
+    let mut it = arg.split_whitespace().peekable();
+    while let Some(word) = it.next() {
+        let flag = match word {
+            "--budget" | "--tokens" => 0,
+            "--cost" => 1,
+            "--turns" | "--iterations" => 2,
+            _ => {
+                words.push(word);
+                continue;
+            }
+        };
+        let Some(value) = it.peek().copied() else {
+            words.push(word);
+            continue;
+        };
+        let cleaned = value.trim_start_matches('$').replace(['_', ','], "");
+        let parsed = match flag {
+            0 => parse_token_count(&cleaned).map(|v| limits.token_budget = Some(v)),
+            1 => cleaned
+                .parse::<f64>()
+                .ok()
+                .map(|v| limits.cost_cap_usd = Some(v)),
+            _ => cleaned
+                .parse::<u32>()
+                .ok()
+                .map(|v| limits.max_iterations = Some(v)),
+        };
+        if parsed.is_some() {
+            it.next();
+        } else {
+            words.push(word);
+        }
+    }
+    (words.join(" "), limits)
+}
+
+/// Accept `50000`, `50k` and `1.5m` for token counts.
+fn parse_token_count(raw: &str) -> Option<i64> {
+    let lowered = raw.to_ascii_lowercase();
+    let (digits, scale) = match lowered.strip_suffix('k') {
+        Some(rest) => (rest, 1_000.0),
+        None => match lowered.strip_suffix('m') {
+            Some(rest) => (rest, 1_000_000.0),
+            None => (lowered.as_str(), 1.0),
+        },
+    };
+    let value: f64 = digits.parse().ok()?;
+    let scaled = value * scale;
+    (scaled.is_finite() && scaled >= 1.0).then(|| scaled.round() as i64)
 }
 
 /// Parse a leading-`/` line into a [`Command`]. Returns `None` for ordinary messages.
@@ -39,8 +124,27 @@ pub fn parse_command(raw: &str) -> Option<Command> {
         "quit" | "exit" => Command::Quit,
         "compact" => Command::Compact,
         "model" => Command::Model((!arg.is_empty()).then(|| arg.to_string())),
-        "goal" => Command::Goal(arg.to_string()),
-        "ralph" => Command::Ralph,
+        "goal" => Command::Goal(match arg {
+            "" => GoalCmd::Show,
+            "edit" => GoalCmd::Edit,
+            "pause" | "stop" => GoalCmd::Pause,
+            "resume" | "continue" | "start" => GoalCmd::Resume,
+            "clear" | "reset" | "none" => GoalCmd::Clear,
+            _ => {
+                let (objective, limits) = parse_goal_args(arg);
+                if objective.trim().is_empty() {
+                    // Flags with no objective just retune the caps on the existing goal.
+                    GoalCmd::Set {
+                        objective: String::new(),
+                        limits,
+                    }
+                } else {
+                    GoalCmd::Set { objective, limits }
+                }
+            }
+        }),
+        // `/ralph` predates `/goal`; keep it working as "get back to the goal".
+        "ralph" => Command::Goal(GoalCmd::Resume),
         other => Command::Unknown(other.to_string()),
     })
 }
@@ -186,9 +290,62 @@ mod tests {
         assert_eq!(parse_command("/model"), Some(Command::Model(None)));
         assert_eq!(
             parse_command("/goal ship it"),
-            Some(Command::Goal("ship it".into()))
+            Some(Command::Goal(GoalCmd::Set {
+                objective: "ship it".into(),
+                limits: GoalLimitArgs::default(),
+            }))
         );
         assert_eq!(parse_command("/wat"), Some(Command::Unknown("wat".into())));
         assert_eq!(parse_command("hello"), None);
+    }
+
+    #[test]
+    fn parses_goal_subcommands() {
+        assert_eq!(parse_command("/goal"), Some(Command::Goal(GoalCmd::Show)));
+        assert_eq!(
+            parse_command("/goal pause"),
+            Some(Command::Goal(GoalCmd::Pause))
+        );
+        assert_eq!(
+            parse_command("/goal clear"),
+            Some(Command::Goal(GoalCmd::Clear))
+        );
+        // `/ralph` is the old name for "keep going".
+        assert_eq!(
+            parse_command("/ralph"),
+            Some(Command::Goal(GoalCmd::Resume))
+        );
+    }
+
+    #[test]
+    fn parses_goal_budget_flags() {
+        let Some(Command::Goal(GoalCmd::Set { objective, limits })) =
+            parse_command("/goal fix the flaky test --budget 50k --cost 2.5 --turns 8")
+        else {
+            panic!("expected a goal set command");
+        };
+        assert_eq!(objective, "fix the flaky test");
+        assert_eq!(limits.token_budget, Some(50_000));
+        assert_eq!(limits.cost_cap_usd, Some(2.5));
+        assert_eq!(limits.max_iterations, Some(8));
+    }
+
+    #[test]
+    fn a_flag_without_a_usable_value_stays_in_the_objective() {
+        let Some(Command::Goal(GoalCmd::Set { objective, limits })) =
+            parse_command("/goal make --budget bigger")
+        else {
+            panic!("expected a goal set command");
+        };
+        assert_eq!(objective, "make --budget bigger");
+        assert!(limits.is_empty());
+    }
+
+    #[test]
+    fn token_counts_accept_k_and_m_suffixes() {
+        assert_eq!(parse_token_count("50000"), Some(50_000));
+        assert_eq!(parse_token_count("50k"), Some(50_000));
+        assert_eq!(parse_token_count("1.5M"), Some(1_500_000));
+        assert_eq!(parse_token_count("nope"), None);
     }
 }

@@ -5,6 +5,7 @@
 //! the agent driver, and pumps input/agent/permission events through `update`. The input line is
 //! a cursor-aware editor with OpenCode-style keybinds; Tab cycles the active mode.
 
+mod goal_display;
 mod input;
 mod markdown;
 mod runtime;
@@ -243,6 +244,8 @@ pub struct Model {
     pub statusline: Option<String>,
     /// A newer published Cordy version, if the startup update check found one.
     pub latest_version: Option<String>,
+    /// Status-bar chip for the session goal (`goal: active · 12.5K/50K · 3m`), when one is set.
+    pub goal_line: Option<String>,
 }
 
 impl Model {
@@ -943,6 +946,15 @@ fn apply_agent(model: &mut Model, ev: AgentEvent) {
                 .transcript
                 .push(Entry::System(format!("  ↳ [{agent}] {note}")));
         }
+        AgentEvent::GoalContinued { objective, turn } => {
+            flush_streaming(model);
+            model.transcript.push(Entry::System(format!(
+                "↻ goal turn {turn} — {}",
+                truncate_objective(&objective)
+            )));
+            model.busy = true;
+            model.status = "goal: working…".into();
+        }
         AgentEvent::Error(e) => {
             flush_streaming(model);
             model.transcript.push(Entry::System(format!("error: {e}")));
@@ -950,6 +962,16 @@ fn apply_agent(model: &mut Model, ev: AgentEvent) {
             model.status = "error".into();
         }
     }
+}
+
+/// One line of an objective, for a transcript note.
+fn truncate_objective(objective: &str) -> String {
+    let line = objective.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= 72 {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(69).collect();
+    format!("{head}…")
 }
 
 fn flush_streaming(model: &mut Model) {

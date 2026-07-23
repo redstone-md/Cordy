@@ -221,6 +221,11 @@ impl SessionStore {
         for m in &msgs {
             self.append(&new_id, m)?;
         }
+        // The session goal lives beside the log, so a fork inherits the objective and its usage.
+        let goal = self.dir.join(format!("{id}.goal.json"));
+        if goal.exists() {
+            let _ = std::fs::copy(&goal, self.dir.join(format!("{new_id}.goal.json")));
+        }
         Ok(new_id)
     }
 }

@@ -29,15 +29,17 @@ use tokio::sync::{mpsc, oneshot};
 
 use std::path::PathBuf;
 
+use super::goal_display::{GOAL_USAGE, goal_status_label, goal_status_line, goal_usage_summary};
 use super::theme::{THEME_NAMES, Theme, theme_by_name};
 use super::{Connect, ConnectStep, Effect, Entry, Model, Msg, update};
 use crate::agents::{AgentRegistry, load_agents};
 use crate::config::Config;
 use crate::core::agent::{AgentEvent, AgentLoop, Session, assemble};
 use crate::core::auth::ApiKeyStore;
-use crate::core::autonomous::{GoalStore, Guardrails, cordy_dir, is_done, iteration_prompt};
 use crate::core::capability::CapabilitySource;
 use crate::core::context::{CompactMode, ContextManager};
+use crate::core::goal::runtime::{GoalRuntime, Pricing};
+use crate::core::goal::{GoalLimits, GoalStore};
 use crate::core::models_dev::{self, Catalog};
 use crate::core::permission::{PermissionEngine, Rule};
 use crate::core::prompt::{
@@ -76,7 +78,6 @@ struct PermissionAsk {
 enum Control {
     SwitchModel(String),
     SwitchProvider(String, String),
-    StartRalph,
     Compact,
     NewSession,
     LoadSession(String),
@@ -101,8 +102,10 @@ enum KeyAction {
         base_url: String,
         key: String,
     },
-    SetGoal(String),
-    StartRalph,
+    /// Drive the session goal (`/goal ...`).
+    Goal(super::input::GoalCmd),
+    /// Load the current objective into the composer for editing (`/goal edit`).
+    GoalEdit,
     Compact,
     Interrupt,
     NewSession,
@@ -422,6 +425,32 @@ fn session_store_dir(cwd: &std::path::Path) -> PathBuf {
         .unwrap_or_else(|| cwd.join(".cordy"))
         .join("sessions")
         .join(project_slug(cwd))
+}
+
+/// The goal file for a session, stored beside its message log so it travels with resume and fork.
+fn goal_path(cwd: &std::path::Path, session_id: &str) -> PathBuf {
+    session_store_dir(cwd).join(format!("{session_id}.goal.json"))
+}
+
+/// Per-million-token pricing for a model, used for the goal's cost cap.
+fn model_pricing(config: &Config, model: &str) -> Pricing {
+    let (price_in, price_out) = config
+        .model(model)
+        .map(|m| (m.price_in, m.price_out))
+        .unwrap_or((None, None));
+    Pricing {
+        input_per_mtok: price_in,
+        output_per_mtok: price_out,
+    }
+}
+
+/// The caps a new goal starts with, from `[goal]` in config.
+fn config_goal_limits(config: &Config) -> GoalLimits {
+    GoalLimits {
+        token_budget: config.goal.token_budget,
+        cost_cap_usd: config.goal.cost_cap_usd,
+        max_iterations: config.goal.max_turns,
+    }
 }
 
 /// A stable, filesystem-safe id for a project path: a readable tail plus an FNV-1a hash of the
@@ -788,8 +817,15 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
     let optimizer = Arc::new(Optimizer::new(config.optimize_enabled()));
     // Shared background-job registry; the UI keeps a handle to show a running-jobs count.
     let bg = crate::tools::builtins::BgRegistry::default();
+    // The session goal. Its store is bound once the session file is known (and re-bound on
+    // /new, resume and fork); the tools and the agent loop share this one runtime.
+    let goal_runtime = Arc::new(GoalRuntime::new(
+        Arc::new(GoalStore::ephemeral()),
+        config.goal_enabled(),
+    ));
+    goal_runtime.set_pricing(model_pricing(&config, &model_name));
     let base_tools: Arc<dyn CapabilitySource> =
-        Arc::new(BuiltinTools::with_bg(optimizer, bg.clone()));
+        Arc::new(BuiltinTools::with_bg(optimizer, bg.clone()).with_goal(goal_runtime.clone()));
     // Agents: project `.cordy/agents` plus global `~/.cordy/agents` (project wins by name).
     let mut agent_vec = load_agents(&cwd.join(".cordy/agents"));
     if let Some(ud) = user_cordy_dir() {
@@ -885,6 +921,9 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
     let (session_id, initial_messages, pending_meta) =
         open_session(&store, &resume, &provider_kind, &model_name, &cwd);
     let mut current_session = session_id.clone(); // tracked in the UI for rename/fork
+    // Bind the goal to this session's file; a restored goal waits for the user before continuing.
+    goal_runtime.rebind(Arc::new(GoalStore::open(goal_path(&cwd, &session_id))));
+    goal_runtime.restore_after_resume();
     let resumed_count = initial_messages.len();
     let subtitle = format!("{provider_kind} · {model_name}");
     let footer = cwd.display().to_string();
@@ -898,16 +937,13 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
     {
         let provider_kind = provider_kind.clone();
         let init_model = model_name.clone();
-        let ralph_cwd = cwd.clone();
         let cancel_slot = cancel_slot.clone();
-        let (price_in, price_out) = config
-            .model(&model_name)
-            .map(|m| (m.price_in, m.price_out))
-            .unwrap_or((None, None));
+        let goal_rt = goal_runtime.clone();
         let compact_threshold = config.compact_threshold.unwrap_or(100_000);
         let compact_auto = config.compact_mode.as_deref() == Some("auto");
         tokio::spawn(async move {
-            let mut agent = AgentLoop::new(provider, registry.clone(), ctx.clone());
+            let mut agent =
+                AgentLoop::new(provider, registry.clone(), ctx.clone()).with_goal(goal_rt.clone());
             let mut session = Session::new(system, init_model);
             session.messages = initial_messages;
             let mut persisted = session.messages.len();
@@ -918,36 +954,58 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                 tokio::select! {
                     maybe = prompt_rx.recv() => {
                         let Some(content) = maybe else { break };
-                        session.push_user_content(content);
-                        let turn_cancel = CancellationToken::new();
-                        if let Ok(mut slot) = cancel_slot.lock() {
-                            *slot = Some(turn_cancel.clone());
-                        }
-                        if let Err(e) = agent.run_turn(&mut session, &agent_tx, &turn_cancel).await {
-                            let _ = agent_tx.send(AgentEvent::Error(e.to_string()));
-                        }
-                        if let Ok(mut slot) = cancel_slot.lock() {
-                            *slot = None;
-                        }
-                        // Create the session file lazily on the first real message so empty
-                        // sessions never hit disk.
-                        if persisted < session.messages.len()
-                            && let Some(meta) = pending_meta.take()
-                        {
-                            let _ = store.create(&meta);
-                        }
-                        for m in &session.messages[persisted..] {
-                            let _ = store.append(&session_id, m);
-                        }
-                        persisted = session.messages.len();
+                        // One user prompt can become several turns: while the goal stays active and
+                        // the user hasn't typed anything new, its continuation prompt feeds the next
+                        // turn. This is the autonomous loop.
+                        let mut next: Option<Vec<ContentBlock>> = Some(content);
+                        while let Some(content) = next.take() {
+                            session.push_user_content(content);
+                            let turn_cancel = CancellationToken::new();
+                            if let Ok(mut slot) = cancel_slot.lock() {
+                                *slot = Some(turn_cancel.clone());
+                            }
+                            if let Err(e) = agent.run_turn(&mut session, &agent_tx, &turn_cancel).await {
+                                let _ = agent_tx.send(AgentEvent::Error(e.to_string()));
+                            }
+                            if let Ok(mut slot) = cancel_slot.lock() {
+                                *slot = None;
+                            }
+                            // Create the session file lazily on the first real message so empty
+                            // sessions never hit disk.
+                            if persisted < session.messages.len()
+                                && let Some(meta) = pending_meta.take()
+                            {
+                                let _ = store.create(&meta);
+                            }
+                            for m in &session.messages[persisted..] {
+                                let _ = store.append(&session_id, m);
+                            }
+                            persisted = session.messages.len();
 
-                        // Auto-compact when the client-side manager says so.
-                        if compact_auto {
-                            let native = agent.provider.caps().native_context_mgmt;
-                            let cm = ContextManager::new(compact_threshold, CompactMode::Auto, native);
-                            if cm.needs_compaction(&session.messages) {
-                                compact_session(&agent, &mut session, compact_threshold, &agent_tx).await;
-                                persisted = persisted.min(session.messages.len());
+                            // Auto-compact when the client-side manager says so. A long goal run
+                            // depends on this: the loop keeps its context instead of discarding it.
+                            if compact_auto {
+                                let native = agent.provider.caps().native_context_mgmt;
+                                let cm = ContextManager::new(compact_threshold, CompactMode::Auto, native);
+                                if cm.needs_compaction(&session.messages) {
+                                    compact_session(&agent, &mut session, compact_threshold, &agent_tx).await;
+                                    persisted = persisted.min(session.messages.len());
+                                }
+                            }
+
+                            // Interrupting a turn also stops the goal loop; a queued user message
+                            // takes precedence over another automatic turn.
+                            if turn_cancel.is_cancelled() || !prompt_rx.is_empty() {
+                                break;
+                            }
+                            if let Some(prompt) = goal_rt.continue_if_idle().await
+                                && let Some(goal) = goal_rt.goal()
+                            {
+                                let _ = agent_tx.send(AgentEvent::GoalContinued {
+                                    objective: goal.objective.clone(),
+                                    turn: goal.iterations_used.saturating_add(1),
+                                });
+                                next = Some(vec![ContentBlock::text(prompt)]);
                             }
                         }
                     }
@@ -955,24 +1013,15 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                         match maybe {
                             Some(Control::SwitchModel(name)) => {
                                 let p = build_provider_for(&provider_kind, &name);
-                                agent = AgentLoop::new(p, registry.clone(), ctx.clone());
+                                agent = AgentLoop::new(p, registry.clone(), ctx.clone())
+                                    .inherit_from(&agent);
                                 session.model = name;
                             }
                             Some(Control::SwitchProvider(kind, name)) => {
                                 let p = build_provider_for(&kind, &name);
-                                agent = AgentLoop::new(p, registry.clone(), ctx.clone());
+                                agent = AgentLoop::new(p, registry.clone(), ctx.clone())
+                                    .inherit_from(&agent);
                                 session.model = name;
-                            }
-                            Some(Control::StartRalph) => {
-                                run_ralph(
-                                    &agent,
-                                    &mut session,
-                                    &ralph_cwd,
-                                    price_in,
-                                    price_out,
-                                    &agent_tx,
-                                )
-                                .await;
                             }
                             Some(Control::Compact) => {
                                 compact_session(&agent, &mut session, compact_threshold, &agent_tx).await;
@@ -1256,6 +1305,10 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                                 "switched to model {name} (context kept)"
                             )));
                             (model.price_in, model.price_out) = resolve_price(&catalog, &config, &name);
+                            goal_runtime.set_pricing(Pricing {
+                                input_per_mtok: model.price_in,
+                                output_per_mtok: model.price_out,
+                            });
                             model.context_window = resolve_context(&catalog, &config, &name);
                             model.model_name = name.clone();
                             model.subtitle = format!("{provider_kind} · {name}");
@@ -1337,6 +1390,7 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                                             "forked → {new_id}"
                                         )));
                                         current_session = new_id.clone();
+                                        bind_goal_to_session(&goal_runtime, &mut model, &cwd, &new_id);
                                         let _ = control_tx.send(Control::LoadSession(new_id));
                                     }
                                     model.sessions_open = false;
@@ -1393,25 +1447,36 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                             let _ = control_tx
                                 .send(Control::SwitchProvider(kind, model.model_name.clone()));
                         }
-                        Some(KeyAction::SetGoal(g)) => {
-                            let store = GoalStore::new(cordy_dir(&cwd));
-                            match store.set_goal(&g) {
-                                Ok(()) => model
-                                    .transcript
-                                    .push(Entry::System(format!("goal set: {g}"))),
-                                Err(e) => model
-                                    .transcript
-                                    .push(Entry::System(format!("goal: {e}"))),
+                        Some(KeyAction::Goal(cmd)) => {
+                            let started = apply_goal_command(
+                                &mut model,
+                                &goal_runtime,
+                                &config,
+                                cmd,
+                            )
+                            .await;
+                            // Setting or resuming a goal starts work right away: hand the
+                            // continuation prompt to the agent task as this turn's input.
+                            if started
+                                && let Some(prompt) = goal_runtime.continue_if_idle().await
+                            {
+                                model.busy = true;
+                                model.status = "goal: working…".into();
+                                turn_start = Some(std::time::Instant::now());
+                                let _ = prompt_tx.send(vec![ContentBlock::text(prompt)]);
                             }
+                            model.goal_line =
+                                goal_runtime.goal().as_ref().map(goal_status_line);
                         }
-                        Some(KeyAction::StartRalph) => {
-                            model.busy = true;
-                            model.status = "ralph-loop running…".into();
-                            model
+                        Some(KeyAction::GoalEdit) => match goal_runtime.goal() {
+                            Some(goal) => {
+                                model.input = format!("/goal {}", goal.objective);
+                                model.cursor = model.input.len();
+                            }
+                            None => model
                                 .transcript
-                                .push(Entry::System("ralph-loop started (guardrail-bounded)".into()));
-                            let _ = control_tx.send(Control::StartRalph);
-                        }
+                                .push(Entry::System(format!("no goal set. {GOAL_USAGE}"))),
+                        },
                         Some(KeyAction::Compact) => {
                             model.busy = true;
                             model.status = "compacting…".into();
@@ -1434,6 +1499,9 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                             model.total_out = 0;
                             model.total_saved = 0;
                             model.transcript.push(Entry::System("new session — context cleared".into()));
+                            // A fresh session starts with no objective.
+                            goal_runtime.clear().await;
+                            model.goal_line = None;
                             let _ = control_tx.send(Control::NewSession);
                         }
                         Some(KeyAction::OpenSessions) => {
@@ -1490,6 +1558,7 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                                 model.transcript = transcript_from(&msgs);
                                 model.transcript.push(Entry::System(format!("resumed session {id}")));
                                 current_session = id.clone();
+                                bind_goal_to_session(&goal_runtime, &mut model, &cwd, &id);
                                 let _ = control_tx.send(Control::LoadSession(id));
                             }
                         }
@@ -1617,6 +1686,8 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                 dirty = true;
                 let done = matches!(a, AgentEvent::TurnComplete { .. });
                 update(&mut model, Msg::Agent(a));
+                // The goal's usage moves as the turn runs; keep the status chip current.
+                model.goal_line = goal_runtime.goal().as_ref().map(goal_status_line);
                 // Push a completion footer (▣ mode · model · Ns) after each reply.
                 if done && let Some(start) = turn_start.take() {
                     let mode = model.mode().to_string();
@@ -1718,6 +1789,11 @@ pub async fn run(resume: Option<String>) -> anyhow::Result<()> {
                             build_palette(&config, &catalog, &live_models, &modes, &pk, &mn);
                         (model.price_in, model.price_out) =
                             resolve_price(&catalog, &config, &model.model_name);
+                        goal_runtime.set_pricing(Pricing {
+                            input_per_mtok: model.price_in,
+                            output_per_mtok: model.price_out,
+                        });
+                        goal_runtime.set_enabled(config.goal_enabled());
                         model.context_window =
                             resolve_context(&catalog, &config, &model.model_name);
                         model.transcript.push(Entry::System("config reloaded".into()));
@@ -2790,8 +2866,10 @@ fn build_palette(
     items.push(cmd("/rename", "rename the current session"));
     items.push(cmd("/new", "start a fresh session"));
     items.push(cmd("/compact", "summarize history to reclaim context"));
-    items.push(cmd("/ralph", "run the autonomous loop toward the goal"));
-    items.push(cmd("/goal", "set the autonomous north-star"));
+    items.push(cmd(
+        "/goal",
+        "set or steer the session goal (autonomous loop)",
+    ));
     items.push(cmd("/thinking", "toggle showing model reasoning"));
     items.push(cmd("/tooloutput", "toggle tool output visibility"));
     items.push(cmd("/animations", "toggle UI animations"));
@@ -2867,7 +2945,7 @@ keys: Tab/Shift+Tab cycle agent · Enter send · ^J/Alt+Enter newline · Esc int
       models: F2/Shift+F2 cycle recent · ^X f favorite
       scroll: wheel · PgUp/PgDn · ^G top · ^Alt+G bottom · ^Alt+U/D half · ^Alt+B/F page · ^Alt+Y/E line
       session: ^R rename · in /sessions: d delete · f fork
-commands: /help /clear /quit /model <name> /goal <text> /ralph /compact
+commands: /help /clear /quit /model <name> /goal [obj|edit|pause|resume|clear] /compact
           /connect /sessions /rename <title> /new
           /thinking /tooloutput /animations (toggles) · /stash /unstash · /skills /mcp
 input: @image <path> attaches an image · @<path> injects a file";
@@ -2875,7 +2953,7 @@ input: @image <path> attaches an image · @<path> injects a file";
 /// Execute a slash command. Returns a [`KeyAction`] for commands the runtime must act on
 /// (`/model`, `/goal`); all other commands are handled inline (mutating the model).
 fn handle_command(model: &mut Model, raw: &str) -> Option<KeyAction> {
-    use super::input::{Command, parse_command};
+    use super::input::{Command, GoalCmd, parse_command};
     if raw.trim() == "/new" {
         return Some(KeyAction::NewSession);
     }
@@ -2996,19 +3074,152 @@ fn handle_command(model: &mut Model, raw: &str) -> Option<KeyAction> {
         Some(Command::Model(None)) => model
             .transcript
             .push(Entry::System("usage: /model <name> to hot-swap".into())),
-        Some(Command::Goal(g)) if !g.trim().is_empty() => {
-            return Some(KeyAction::SetGoal(g));
-        }
-        Some(Command::Goal(_)) => model.transcript.push(Entry::System(
-            "usage: /goal <text> to set the autonomous north-star".into(),
-        )),
-        Some(Command::Ralph) => return Some(KeyAction::StartRalph),
+        // `/goal edit` puts the objective back in the composer; everything else goes to the runtime.
+        Some(Command::Goal(GoalCmd::Edit)) => return Some(KeyAction::GoalEdit),
+        Some(Command::Goal(cmd)) => return Some(KeyAction::Goal(cmd)),
         Some(Command::Unknown(u)) => model
             .transcript
             .push(Entry::System(format!("unknown command: /{u}"))),
         None => {}
     }
     None
+}
+
+/// Point the goal runtime at `session_id`'s goal file and refresh the status chip. The restored
+/// goal does not auto-continue until the user runs a turn.
+fn bind_goal_to_session(
+    goal: &Arc<GoalRuntime>,
+    model: &mut Model,
+    cwd: &std::path::Path,
+    session_id: &str,
+) {
+    goal.rebind(Arc::new(GoalStore::open(goal_path(cwd, session_id))));
+    goal.restore_after_resume();
+    model.goal_line = goal.goal().as_ref().map(goal_status_line);
+}
+
+/// Run a `/goal` subcommand against the runtime, reporting the outcome in the transcript.
+///
+/// Returns true when the session should start working on the goal right away (a fresh objective or
+/// an explicit resume) — the caller turns that into the first turn.
+async fn apply_goal_command(
+    model: &mut Model,
+    goal: &Arc<GoalRuntime>,
+    config: &Config,
+    cmd: super::input::GoalCmd,
+) -> bool {
+    use super::input::GoalCmd;
+
+    if !goal.is_enabled() {
+        model.transcript.push(Entry::System(
+            "goals are disabled — set `goal = true` in config.toml".into(),
+        ));
+        return false;
+    }
+
+    let note = |model: &mut Model, text: String| model.transcript.push(Entry::System(text));
+    match cmd {
+        GoalCmd::Show => {
+            match goal.goal() {
+                Some(g) => note(
+                    model,
+                    format!(
+                        "goal ({}): {}",
+                        goal_status_label(g.status),
+                        goal_usage_summary(&g)
+                    ),
+                ),
+                None => note(model, format!("no goal set. {GOAL_USAGE}")),
+            }
+            false
+        }
+        GoalCmd::Set { objective, limits } => {
+            // Caps with no objective just retune the existing goal.
+            if objective.trim().is_empty() {
+                if limits.is_empty() {
+                    note(model, GOAL_USAGE.to_string());
+                    return false;
+                }
+                let existing = goal.goal().map(|g| g.limits).unwrap_or_default();
+                let merged = GoalLimits {
+                    token_budget: limits.token_budget.or(existing.token_budget),
+                    cost_cap_usd: limits.cost_cap_usd.or(existing.cost_cap_usd),
+                    max_iterations: limits.max_iterations.or(existing.max_iterations),
+                };
+                return match goal.set_limits(merged).await {
+                    Ok(g) => {
+                        note(
+                            model,
+                            format!("goal budget updated. {}", goal_usage_summary(&g)),
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        note(model, format!("goal: {e}"));
+                        false
+                    }
+                };
+            }
+
+            let defaults = config_goal_limits(config);
+            let limits = GoalLimits {
+                token_budget: limits.token_budget.or(defaults.token_budget),
+                cost_cap_usd: limits.cost_cap_usd.or(defaults.cost_cap_usd),
+                max_iterations: limits.max_iterations.or(defaults.max_iterations),
+            };
+            // An unfinished goal is replaced by editing its objective, which also steers a turn
+            // that is already running. Editing keeps the usage clock running, so caps given on the
+            // same line are applied on top rather than dropped.
+            let result = match goal.goal() {
+                Some(g) if g.status != crate::core::goal::GoalStatus::Complete => {
+                    match goal.set_objective(&objective).await {
+                        Ok(g) if limits != g.limits => goal.set_limits(limits).await,
+                        other => other,
+                    }
+                }
+                _ => goal.create_goal(&objective, limits).await,
+            };
+            match result {
+                Ok(g) => {
+                    note(model, format!("goal set: {}", goal_usage_summary(&g)));
+                    true
+                }
+                Err(e) => {
+                    note(model, format!("goal: {e}"));
+                    false
+                }
+            }
+        }
+        GoalCmd::Pause => match goal.pause().await {
+            Ok(g) => {
+                note(model, format!("goal paused. {}", goal_usage_summary(&g)));
+                false
+            }
+            Err(e) => {
+                note(model, format!("goal: {e}"));
+                false
+            }
+        },
+        GoalCmd::Resume => match goal.resume().await {
+            Ok(g) => {
+                note(model, format!("goal resumed. {}", goal_usage_summary(&g)));
+                true
+            }
+            Err(e) => {
+                note(model, format!("goal: {e}"));
+                false
+            }
+        },
+        GoalCmd::Clear => {
+            match goal.clear().await {
+                Some(g) => note(model, format!("goal cleared: {}", g.objective)),
+                None => note(model, "no goal to clear".into()),
+            }
+            false
+        }
+        // Handled by the caller (it needs the composer).
+        GoalCmd::Edit => false,
+    }
 }
 
 /// Estimated USD cost for accumulated usage given per-million pricing.
@@ -3089,58 +3300,6 @@ async fn compact_session(
     let _ = agent_tx.send(AgentEvent::Error(format!(
         "compacted {n} older messages into a summary"
     )));
-}
-
-/// Drive the autonomous ralph-loop: each iteration rebuilds a fresh context from the goal + the
-/// on-disk progress notes, runs one turn, records progress, and stops on completion or a
-/// guardrail (iteration cap / cost cap). The fresh-context-per-iteration is the ralph insight —
-/// long tasks don't drown in context because the durable state lives on disk.
-async fn run_ralph(
-    agent: &AgentLoop,
-    session: &mut Session,
-    cwd: &std::path::Path,
-    price_in: Option<f64>,
-    price_out: Option<f64>,
-    agent_tx: &mpsc::UnboundedSender<AgentEvent>,
-) {
-    let store = GoalStore::new(cordy_dir(cwd));
-    let Some(goal) = store.goal() else {
-        let _ = agent_tx.send(AgentEvent::Error(
-            "ralph: no goal — use /goal <text> first".into(),
-        ));
-        return;
-    };
-    let guard = Guardrails::default();
-    let mut iteration = 0usize;
-    loop {
-        let progress = store.progress();
-        let prompt = iteration_prompt(&goal, &progress);
-        session.messages.clear(); // ralph: discard rotting context; goal+progress live on disk
-        session.push_user(prompt);
-        if let Err(e) = agent
-            .run_turn(session, agent_tx, &CancellationToken::new())
-            .await
-        {
-            let _ = agent_tx.send(AgentEvent::Error(format!("ralph: {e}")));
-            break;
-        }
-        iteration += 1;
-        let reply = last_assistant_text(&session.messages);
-        let updated = format!("{progress}\n\n## iteration {iteration}\n{reply}");
-        let _ = store.set_progress(updated.trim_start());
-
-        let spent = usage_cost(&session.total_usage, price_in, price_out);
-        let done = is_done(&reply);
-        if !guard.should_continue(iteration, spent, done) {
-            let reason = guard
-                .stop_reason(iteration, spent, done)
-                .unwrap_or("stopped");
-            let _ = agent_tx.send(AgentEvent::Error(format!(
-                "ralph stopped: {reason} (iteration {iteration})"
-            )));
-            break;
-        }
-    }
 }
 
 // ---- rendering -----------------------------------------------------------------------------
@@ -3404,6 +3563,13 @@ fn view(f: &mut Frame, model: &mut Model, theme: &Theme) {
             left.push(Span::styled(
                 format!("{spin}{}", model.status),
                 Style::default().fg(theme.accent),
+            ));
+        }
+        // An unattended goal run is worth a permanent reminder of what is being spent.
+        if let Some(goal) = &model.goal_line {
+            left.push(Span::styled(
+                format!("  {goal}"),
+                Style::default().fg(theme.dim),
             ));
         }
         // Right: tokens (context %) + a single hint.
@@ -3883,6 +4049,7 @@ fn render_statusline(tpl: &str, model: &Model, spin: &str) -> String {
         .replace("{saved}", &format!("~{}", model.total_saved))
         .replace("{status}", &model.status)
         .replace("{spinner}", spin.trim_end())
+        .replace("{goal}", model.goal_line.as_deref().unwrap_or(""))
         .replace("{bg}", &model.bg_count.to_string())
         .replace("{agents}", &model.subagent_count.to_string())
         .replace("{version}", env!("CARGO_PKG_VERSION"))
@@ -3912,8 +4079,7 @@ fn slash_desc(cmd: &str) -> &'static str {
     match cmd {
         "/help" => "keybinds & commands",
         "/model" => "hot-swap model",
-        "/goal" => "set the autonomous north-star",
-        "/ralph" => "run the autonomous loop",
+        "/goal" => "set or steer the session goal",
         "/compact" => "summarize history",
         "/clear" => "clear the transcript",
         "/quit" => "exit cordy",
@@ -3936,11 +4102,10 @@ fn slash_desc(cmd: &str) -> &'static str {
 }
 
 /// Slash commands offered by inline autocomplete.
-const SLASH_COMMANDS: [&str; 21] = [
+const SLASH_COMMANDS: [&str; 20] = [
     "/help",
     "/model",
     "/goal",
-    "/ralph",
     "/compact",
     "/clear",
     "/quit",

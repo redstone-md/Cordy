@@ -14,6 +14,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::goal::runtime::{GoalRuntime, StopReason};
 use crate::core::types::{ChatRequest, ContentBlock, Message, Role, ToolOutput, Usage, WireEvent};
 use crate::provider::Provider;
 use crate::tools::{Registry, ToolCtx};
@@ -40,6 +41,11 @@ pub enum AgentEvent {
     SubAgent {
         agent: String,
         note: String,
+    },
+    /// The goal loop started another turn on its own.
+    GoalContinued {
+        objective: String,
+        turn: u32,
     },
     Error(String),
 }
@@ -81,6 +87,10 @@ pub struct AgentLoop {
     pub registry: Arc<Registry>,
     pub ctx: ToolCtx,
     pub max_tokens: Option<u32>,
+    /// When set, every turn is charged against the session goal and can be steered by it.
+    pub goal: Option<Arc<GoalRuntime>>,
+    /// Numbers turns so goal accounting can tell them apart.
+    turn_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AgentLoop {
@@ -90,24 +100,82 @@ impl AgentLoop {
             registry,
             ctx,
             max_tokens: None,
+            goal: None,
+            turn_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Charge this loop's turns against `goal` and let it inject steering messages.
+    pub fn with_goal(mut self, goal: Arc<GoalRuntime>) -> Self {
+        self.goal = Some(goal);
+        self
+    }
+
+    /// Carry the goal wiring and turn counter over to a rebuilt loop (model/provider hot-swap).
+    pub fn inherit_from(mut self, other: &AgentLoop) -> Self {
+        self.goal = other.goal.clone();
+        self.turn_seq = other.turn_seq.clone();
+        self
+    }
+
+    fn next_turn_id(&self) -> String {
+        let n = self
+            .turn_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("turn-{n}")
     }
 
     /// Run one user turn to completion: stream, assemble, run tools, feed back, repeat until the
     /// model stops requesting tools. Display events are sent to `events`. Cancelling `cancel`
     /// ends the turn at the next safe point (between the stream and the next request).
+    ///
+    /// When a goal is attached, the turn is bracketed by its accounting hooks so usage is charged
+    /// even if the turn is interrupted or fails.
     pub async fn run_turn(
         &self,
         session: &mut Session,
         events: &UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
+        let turn_id = self.next_turn_id();
+        if let Some(goal) = &self.goal {
+            goal.on_turn_start(&turn_id, session.total_usage);
+        }
+        let result = self.drive_turn(&turn_id, session, events, cancel).await;
+        if let Some(goal) = &self.goal {
+            goal.on_iteration(&turn_id);
+            match &result {
+                Err(e) => {
+                    goal.on_turn_error(&turn_id, stop_reason_for(&e.to_string()))
+                        .await
+                }
+                Ok(TurnEnd::Interrupted) => goal.on_turn_abort(&turn_id).await,
+                Ok(TurnEnd::Completed) => goal.on_turn_stop(&turn_id).await,
+            }
+        }
+        result.map(|_| ())
+    }
+
+    async fn drive_turn(
+        &self,
+        turn_id: &str,
+        session: &mut Session,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<TurnEnd> {
         loop {
             if cancel.is_cancelled() {
                 let _ = events.send(AgentEvent::TurnComplete {
                     usage: Usage::default(),
                 });
-                return Ok(());
+                return Ok(TurnEnd::Interrupted);
+            }
+            // Hidden goal steering (budget wrap-up, edited objective) rides in as a user message
+            // before the next request, so the model sees it at the first opportunity.
+            if let Some(goal) = &self.goal {
+                for text in goal.take_pending_steering() {
+                    session.messages.push(Message::user(text));
+                }
             }
             let req = ChatRequest {
                 model: session.model.clone(),
@@ -124,7 +192,7 @@ impl AgentLoop {
                 s = self.provider.stream(req) => s?,
                 _ = cancel.cancelled() => {
                     let _ = events.send(AgentEvent::TurnComplete { usage: Usage::default() });
-                    return Ok(());
+                    return Ok(TurnEnd::Interrupted);
                 }
             };
             let tap = events.clone();
@@ -143,11 +211,14 @@ impl AgentLoop {
                 }) => r?,
                 _ = cancel.cancelled() => {
                     let _ = events.send(AgentEvent::TurnComplete { usage: Usage::default() });
-                    return Ok(());
+                    return Ok(TurnEnd::Interrupted);
                 }
             };
 
             session.total_usage = add_usage(session.total_usage, usage);
+            if let Some(goal) = &self.goal {
+                goal.on_token_usage(turn_id, session.total_usage);
+            }
 
             // Some models (Gemma, Qwen/Hermes-style, and endpoints that render tool calls as text)
             // don't populate the structured `tool_calls` field — recover any text-encoded calls so
@@ -185,7 +256,7 @@ impl AgentLoop {
                     ));
                 }
                 let _ = events.send(AgentEvent::TurnComplete { usage });
-                return Ok(());
+                return Ok(TurnEnd::Completed);
             }
 
             let mut results = Vec::with_capacity(tool_uses.len());
@@ -221,10 +292,15 @@ impl AgentLoop {
                 };
                 let _ = events.send(AgentEvent::ToolFinished {
                     id: id.clone(),
-                    name,
+                    name: name.clone(),
                     output: output.clone(),
                 });
                 results.push(ContentBlock::ToolResult { id, out: output });
+                // Charge the goal as work lands, so a budget can stop the turn mid-flight instead
+                // of only after every tool has run.
+                if let Some(goal) = &self.goal {
+                    goal.on_tool_finish(turn_id, &name).await;
+                }
             }
             session.messages.push(Message {
                 role: Role::Tool,
@@ -234,9 +310,29 @@ impl AgentLoop {
                 let _ = events.send(AgentEvent::TurnComplete {
                     usage: Usage::default(),
                 });
-                return Ok(());
+                return Ok(TurnEnd::Interrupted);
             }
         }
+    }
+}
+
+/// How a turn finished, so the goal hooks can tell an abort from a clean stop.
+enum TurnEnd {
+    Completed,
+    Interrupted,
+}
+
+/// Classify a turn-ending error: a provider quota is recoverable later, anything else blocks the
+/// goal so the automatic loop can't spin on the same failure.
+fn stop_reason_for(error: &str) -> StopReason {
+    let lowered = error.to_ascii_lowercase();
+    let usage_limit = ["usage limit", "quota", "insufficient_quota", "billing"]
+        .iter()
+        .any(|needle| lowered.contains(needle));
+    if usage_limit {
+        StopReason::UsageLimit
+    } else {
+        StopReason::TurnError
     }
 }
 
@@ -463,5 +559,192 @@ mod tests {
         // History: user, assistant(tool_use), tool(result), assistant(text).
         assert_eq!(session.messages.len(), 4);
         assert_eq!(session.messages[3].role, Role::Assistant);
+    }
+
+    // ---- goal-driven turns -------------------------------------------------------------------
+
+    use crate::core::goal::runtime::GoalRuntime;
+    use crate::core::goal::{GoalLimits, GoalStatus, GoalStore};
+
+    /// A turn that reads a file, then replies.
+    fn read_then_reply(reply: &str) -> VecDeque<Vec<WireEvent>> {
+        VecDeque::from(vec![
+            vec![
+                WireEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "read".into(),
+                },
+                WireEvent::ToolInputDelta {
+                    id: "t1".into(),
+                    json: "{\"path\":\"f.txt\"}".into(),
+                },
+                WireEvent::ToolUseEnd { id: "t1".into() },
+                WireEvent::Usage(Usage {
+                    input_tokens: 400,
+                    output_tokens: 100,
+                    ..Default::default()
+                }),
+                WireEvent::Done,
+            ],
+            vec![WireEvent::TextDelta(reply.into()), WireEvent::Done],
+        ])
+    }
+
+    fn goal_agent(
+        scripts: VecDeque<Vec<WireEvent>>,
+        goal: Arc<GoalRuntime>,
+        cwd: &std::path::Path,
+    ) -> AgentLoop {
+        let provider = Arc::new(MockProvider {
+            scripts: Mutex::new(scripts),
+        });
+        let mut reg = Registry::new();
+        let tools = BuiltinTools::new(Arc::new(Optimizer::new(true))).with_goal(goal.clone());
+        for t in tools.tools() {
+            reg.register(t);
+        }
+        AgentLoop::new(provider, Arc::new(reg), ToolCtx::new(cwd)).with_goal(goal)
+    }
+
+    #[tokio::test]
+    async fn a_turn_charges_its_usage_to_the_active_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hello world").unwrap();
+        let goal = Arc::new(GoalRuntime::new(Arc::new(GoalStore::ephemeral()), true));
+        goal.create_goal("ship the parser", GoalLimits::tokens(Some(10_000)))
+            .await
+            .unwrap();
+
+        let agent = goal_agent(read_then_reply("done for now"), goal.clone(), dir.path());
+        let mut session = Session::new("sys", "mock");
+        session.push_user("get going");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        agent
+            .run_turn(&mut session, &tx, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let g = goal.goal().unwrap();
+        assert_eq!(g.tokens_used, 500, "fresh input + output are charged");
+        assert_eq!(g.iterations_used, 1);
+        assert_eq!(g.status, GoalStatus::Active);
+        // Still active, so the session would take another turn on its own.
+        assert!(goal.continue_if_idle().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn crossing_the_budget_mid_turn_injects_the_wrap_up_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hello world").unwrap();
+        let goal = Arc::new(GoalRuntime::new(Arc::new(GoalStore::ephemeral()), true));
+        goal.create_goal("ship the parser", GoalLimits::tokens(Some(100)))
+            .await
+            .unwrap();
+
+        let agent = goal_agent(read_then_reply("wrapping up"), goal.clone(), dir.path());
+        let mut session = Session::new("sys", "mock");
+        session.push_user("get going");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        agent
+            .run_turn(&mut session, &tx, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(goal.goal().unwrap().status, GoalStatus::BudgetLimited);
+        // The wrap-up prompt was injected into the conversation before the follow-up request.
+        let injected = session.messages.iter().any(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|b| {
+                    matches!(b, ContentBlock::Text { text }
+                        if text.contains("do not start new substantive work"))
+                })
+        });
+        assert!(injected, "the model must be told to land the plane");
+        // A budget-limited goal does not start another turn on its own.
+        assert!(goal.continue_if_idle().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_model_ends_the_loop_by_completing_the_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let goal = Arc::new(GoalRuntime::new(Arc::new(GoalStore::ephemeral()), true));
+        goal.create_goal("ship the parser", GoalLimits::default())
+            .await
+            .unwrap();
+
+        // Turn 1 does work; turn 2 (the automatic continuation) declares the goal complete.
+        let scripts = VecDeque::from(vec![
+            vec![
+                WireEvent::TextDelta("made progress".into()),
+                WireEvent::Usage(Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    ..Default::default()
+                }),
+                WireEvent::Done,
+            ],
+            vec![
+                WireEvent::ToolUseStart {
+                    id: "u1".into(),
+                    name: "update_goal".into(),
+                },
+                WireEvent::ToolInputDelta {
+                    id: "u1".into(),
+                    json: "{\"status\":\"complete\"}".into(),
+                },
+                WireEvent::ToolUseEnd { id: "u1".into() },
+                WireEvent::Done,
+            ],
+            vec![
+                WireEvent::TextDelta("goal achieved".into()),
+                WireEvent::Done,
+            ],
+        ]);
+        let agent = goal_agent(scripts, goal.clone(), dir.path());
+        let mut session = Session::new("sys", "mock");
+        session.push_user("get going");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Drive the same loop the TUI runs: turn, then continue while the goal stays active.
+        let mut turns = 0;
+        loop {
+            agent
+                .run_turn(&mut session, &tx, &CancellationToken::new())
+                .await
+                .unwrap();
+            turns += 1;
+            match goal.continue_if_idle().await {
+                Some(prompt) => session.push_user(prompt),
+                None => break,
+            }
+            assert!(turns < 5, "the loop must terminate");
+        }
+
+        assert_eq!(turns, 2, "one user turn plus one automatic continuation");
+        assert_eq!(goal.goal().unwrap().status, GoalStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_blocks_the_goal_instead_of_retrying_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let goal = Arc::new(GoalRuntime::new(Arc::new(GoalStore::ephemeral()), true));
+        goal.create_goal("ship the parser", GoalLimits::default())
+            .await
+            .unwrap();
+
+        let scripts = VecDeque::from(vec![vec![WireEvent::Error("stream exploded".into())]]);
+        let agent = goal_agent(scripts, goal.clone(), dir.path());
+        let mut session = Session::new("sys", "mock");
+        session.push_user("get going");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(
+            agent
+                .run_turn(&mut session, &tx, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(goal.goal().unwrap().status, GoalStatus::Blocked);
+        assert!(goal.continue_if_idle().await.is_none());
     }
 }

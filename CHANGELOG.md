@@ -8,8 +8,46 @@ All notable changes to Cordy are documented here. The format follows
 
 Initial public release preparation: OpenCode-inspired TUI, hot-swap models and providers across
 all four API families, builtin toolset with a native output optimizer, background jobs, MCP,
-skills, sub-agents, autonomous ralph-loop, session persistence, permission rules, eight themes,
+skills, sub-agents, autonomous goals, session persistence, permission rules, eight themes,
 and config hot-reload.
+
+## [0.1.7]
+
+### Added
+- **Session goals — a real autonomous loop.** `/goal <objective>` sets an objective the session
+  keeps working on by itself: every finished turn feeds the next one until the work is done, the
+  budget runs out, or the agent is genuinely stuck. Six statuses (`active`, `paused`, `blocked`,
+  `usage limited`, `limited by budget`, `complete`), and the model gets `get_goal`, `create_goal`
+  and `update_goal` — it may declare a goal complete or blocked, while pausing, resuming and
+  raising budgets stay with you.
+  - Usage is charged **as each tool finishes**, not at the end of a turn, so a budget can stop a
+    run mid-turn; at that moment the model is told to wrap up instead of starting new work.
+  - Completion is audited: the agent must prove each requirement against the current worktree
+    before marking a goal complete, and may only report `blocked` after the same obstacle recurs
+    for three consecutive turns.
+  - Budgets: `--budget <tokens>`, `--cost <usd>`, `--turns <n>` (defaults under `[goal]` in
+    config). Whichever is reached first ends the run.
+  - `/goal` alone shows status; `edit`, `pause`, `resume`, `clear` do what they say. A status chip
+    in the footer tracks objective, tokens and elapsed time. The goal is stored beside the session
+    log, survives `--resume`, and is inherited by a fork — a restored goal waits for you before
+    spending anything.
+- **`apply_patch`** — a new builtin that applies a multi-file, multi-hunk patch (add, update,
+  rename, delete) as one reviewed unit. Context is matched with graduated tolerance — exact, then
+  ignoring trailing whitespace, then all whitespace, then normalizing typographic punctuation — so
+  a patch whose context drifted slightly still lands. The patch is fully resolved before anything
+  is written: the diff you approve is exactly what is applied, and a patch that doesn't fit leaves
+  the worktree untouched. `edit` remains the right tool for a single unique replacement.
+
+### Changed
+- **`/ralph` is gone**, replaced by `/goal` (the old name still works as an alias for
+  `/goal resume`). The ralph loop discarded its context every iteration and tracked progress in
+  `.cordy/progress.md`; goals keep the conversation, lean on auto-compaction, and treat the
+  worktree — not a notes file — as the record of what has been done. `.cordy/progress.md` and
+  `.cordy/goal.md` are no longer written.
+
+### Fixed
+- Adjacent same-role messages are merged for the Anthropic Messages API, which requires strictly
+  alternating roles.
 
 ## [0.1.6]
 

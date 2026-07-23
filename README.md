@@ -33,8 +33,10 @@ compressed by a native token optimizer, and speaks the Model Context Protocol.
   one, context intact. `^P` → pick a model, or `/connect` to add a provider.
 - **Every API family** — OpenAI Chat, OpenAI-compatible (Ollama / vLLM / OpenRouter / Groq / …),
   Anthropic Messages, OpenAI Responses. Wire formats never leak past the adapter.
-- **Builtin tools** — `read` `write` `edit` `multiedit` `grep` `glob` `ls` `bash` `todo` `web_search`
-  `web_fetch` `process` `rewind`, all behind a permission gate you can pre-approve with globs.
+- **Builtin tools** — `read` `write` `edit` `apply_patch` `multiedit` `grep` `glob` `ls` `bash`
+  `todo` `web_search` `web_fetch` `process` `rewind`, all behind a permission gate you can
+  pre-approve with globs. `apply_patch` applies a multi-file, multi-hunk patch as one reviewed
+  unit, matching context tolerantly so near-miss whitespace and smart quotes still land.
 - **Background jobs** — run a dev server with `bash background:true`, then `process` to poll,
   wait on a regex, or kill the whole process tree.
 - **MCP, skills, sub-agents** — connect MCP servers, load progressive-disclosure skills, and
@@ -116,7 +118,31 @@ launch. All user state — config, keys, sessions, cache — lives under `~/.cor
 | wheel · `PgUp`/`PgDn` · `^G` | scroll the transcript |
 
 Slash commands include `/connect` `/providers` `/model` `/sessions` `/permissions` `/mouse`
-`/thinking` `/compact` `/goal` `/ralph` and more — type `/` to autocomplete.
+`/thinking` `/compact` `/goal` and more — type `/` to autocomplete.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://gfx.redstone.md/strip?label=Goals&note=long-running%20work%2C%20on%20a%20budget&theme=dark">
+  <img alt="Goals" src="https://gfx.redstone.md/strip?label=Goals&note=long-running%20work%2C%20on%20a%20budget&theme=light" width="840">
+</picture>
+
+A goal is an objective the session keeps working on by itself. While it is active, each finished
+turn feeds the next one, so a long task runs unattended until it is done, out of budget, or stuck.
+
+```
+/goal fix the flaky auth test --budget 200k --cost 2.50 --turns 20
+/goal                 # status: objective, tokens, elapsed
+/goal edit            # load the objective back into the composer
+/goal pause           # stop the loop, keep the goal
+/goal resume          # back to work
+/goal clear           # drop it
+```
+
+Budgets are the safety rail: whichever of tokens, dollars or turns runs out first flips the goal to
+*limited by budget*, and the model is told to wrap up rather than start new work. It stops on its
+own too — the agent marks the goal complete only after auditing the objective against the current
+worktree, or blocked after the same obstacle recurs three turns running. `Esc` or typing anything
+interrupts the loop; a resumed session waits for you before spending again. Defaults live under
+`[goal]` in the config, and the goal travels with the session (including forks).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://gfx.redstone.md/strip?label=Configuration&note=hot-reloaded%20%C2%B7%20secrets%20stay%20in%20env&theme=dark">
@@ -135,6 +161,13 @@ theme = "tokyonight"   # mono (default) · dark · tokyonight · catppuccin · g
 [colors]
 accent  = "#7aa2f7"
 surface = "#24283b"
+
+# Autonomous goals: whichever cap is hit first ends the run
+[goal]
+enabled      = true
+token_budget = 200000
+cost_cap_usd = 5.0
+max_turns    = 20
 
 # Pre-approve commands so the agent stops asking
 [permissions]
@@ -164,7 +197,7 @@ enabled = true
 ```
 src/
   core/       canonical model (ContentBlock/Message/WireEvent), agent loop, prompt, context,
-              sessions, permissions, autonomous (ralph) loop, auth
+              sessions, permissions, goals (autonomous loop), auth
   provider/   Provider trait + one adapter per API family (+ retry decorator)
   tools/      Tool trait, builtins, native output optimizer, sub-agents, background jobs
   skills/     progressive-disclosure skill loader

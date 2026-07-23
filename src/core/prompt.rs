@@ -33,6 +33,9 @@ pub struct PromptContext<'a> {
     pub cognitive_core: bool,
 }
 
+/// The `apply_patch` patch format, appended when that tool is available.
+const APPLY_PATCH_INSTRUCTIONS: &str = include_str!("apply_patch_instructions.md");
+
 const FULL_PREAMBLE: &str = "\
 You are Cordy, an expert autonomous coding agent operating in the user's terminal. You help by \
 reading files, running commands, editing code, and writing new files — working directly in the \
@@ -41,7 +44,8 @@ project with the tools provided.
 ## How you work
 - Understand before you act: read the relevant files and search the codebase before proposing or \
 making changes.
-- Edit precisely: use `edit` with an exact, unique `old` string; keep diffs minimal and focused; \
+- Edit precisely: use `apply_patch` for anything spanning several hunks or files, and `edit` with \
+an exact, unique `old` string for a single small replacement; keep diffs minimal and focused; \
 never reformat or touch unrelated code.
 - Match the surroundings: follow the project's existing style, naming, and conventions.
 - Verify your work: after changes, build/test/run what's relevant and report the actual result — \
@@ -64,8 +68,9 @@ confirm intent unless clearly authorized.
 const LEAN_PREAMBLE: &str = "\
 You are Cordy, a compact coding agent that drives tools. You hold little built-in knowledge — \
 rely on tools: read files, grep, run commands, and search the web instead of recalling. Take one \
-concrete step at a time and keep output terse. Use `edit` with an exact, unique `old` string; \
-read before you edit; verify every change.";
+concrete step at a time and keep output terse. Use `apply_patch` for multi-hunk or multi-file \
+changes and `edit` with an exact, unique `old` string for a single replacement; read before you \
+edit; verify every change.";
 
 /// Assemble the full system prompt string.
 pub fn build_system_prompt(ctx: &PromptContext) -> String {
@@ -101,6 +106,13 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         s.push_str("\n<project_context>\n");
         s.push_str(pc.trim());
         s.push_str("\n</project_context>\n");
+    }
+
+    // 4b. Patch format, only when the tool that reads it is registered.
+    if ctx.tool_names.iter().any(|t| t == "apply_patch") {
+        s.push_str("\n\n");
+        s.push_str(APPLY_PATCH_INSTRUCTIONS.trim());
+        s.push('\n');
     }
 
     // 5. Capabilities (skills / sub-agents / MCP fragments).

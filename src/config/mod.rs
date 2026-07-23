@@ -23,6 +23,8 @@ pub struct Config {
     pub compact_threshold: Option<u64>,
     /// `manual` | `auto`.
     pub compact_mode: Option<String>,
+    /// `[goal]` — the autonomous goal loop and its default budgets.
+    pub goal: GoalConfig,
     #[serde(rename = "provider")]
     pub providers: Vec<ProviderProfile>,
     #[serde(rename = "model")]
@@ -33,6 +35,19 @@ pub struct Config {
     pub permissions: PermissionConfig,
     /// Per-role color overrides (`#rrggbb`) applied on top of the selected theme.
     pub colors: ColorConfig,
+}
+
+/// Defaults for `/goal`. The caps are what stop an unattended run: whichever is reached first
+/// puts the goal in `budget_limited` and tells the model to wrap up. Absent means "no cap".
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GoalConfig {
+    /// `/goal` and its tools on/off (default on).
+    pub enabled: Option<bool>,
+    pub token_budget: Option<i64>,
+    pub cost_cap_usd: Option<f64>,
+    /// Cap on automatic goal turns.
+    pub max_turns: Option<u32>,
 }
 
 /// Hex color overrides for the UI theme. Any unset field keeps the theme's default.
@@ -125,6 +140,11 @@ impl Config {
         self.mascot.unwrap_or(true)
     }
 
+    /// Whether `/goal` and its tools are available (default true).
+    pub fn goal_enabled(&self) -> bool {
+        self.goal.enabled.unwrap_or(true)
+    }
+
     pub fn model(&self, name: &str) -> Option<&ModelProfile> {
         self.models.iter().find(|m| m.name == name)
     }
@@ -139,6 +159,11 @@ impl Config {
         self.compact_model = over.compact_model.or(self.compact_model);
         self.compact_threshold = over.compact_threshold.or(self.compact_threshold);
         self.compact_mode = over.compact_mode.or(self.compact_mode);
+        let goal = &mut self.goal;
+        goal.enabled = over.goal.enabled.or(goal.enabled);
+        goal.token_budget = over.goal.token_budget.or(goal.token_budget);
+        goal.cost_cap_usd = over.goal.cost_cap_usd.or(goal.cost_cap_usd);
+        goal.max_turns = over.goal.max_turns.or(goal.max_turns);
         merge_by_name(&mut self.providers, over.providers, |p| p.name.clone());
         merge_by_name(&mut self.models, over.models, |m| m.name.clone());
         merge_by_name(&mut self.mcp_servers, over.mcp_servers, |s| s.name.clone());
@@ -349,6 +374,37 @@ mod tests {
         assert!(cfg.model("qwen2.5-coder-3b").unwrap().cognitive_core);
         assert!(!cfg.model("gpt-4o").unwrap().cognitive_core);
         assert!(cfg.optimize_enabled());
+    }
+
+    #[test]
+    fn goal_defaults_to_enabled_with_no_caps() {
+        let cfg = Config::parse("").unwrap();
+        assert!(cfg.goal_enabled());
+        assert_eq!(cfg.goal.token_budget, None);
+
+        let cfg = Config::parse(
+            r#"
+            [goal]
+            enabled = false
+            token_budget = 200000
+            cost_cap_usd = 2.5
+            max_turns = 20
+        "#,
+        )
+        .unwrap();
+        assert!(!cfg.goal_enabled());
+        assert_eq!(cfg.goal.token_budget, Some(200_000));
+        assert_eq!(cfg.goal.cost_cap_usd, Some(2.5));
+        assert_eq!(cfg.goal.max_turns, Some(20));
+    }
+
+    #[test]
+    fn project_goal_caps_override_the_user_ones_field_by_field() {
+        let user = Config::parse("[goal]\ntoken_budget = 100000\ncost_cap_usd = 1.0").unwrap();
+        let project = Config::parse("[goal]\ncost_cap_usd = 5.0").unwrap();
+        let merged = user.merged_with(project);
+        assert_eq!(merged.goal.token_budget, Some(100_000), "kept from user");
+        assert_eq!(merged.goal.cost_cap_usd, Some(5.0), "project wins");
     }
 
     #[test]

@@ -14,6 +14,7 @@ use serde_json::Value;
 use crate::core::checkpoint::CheckpointStore;
 use crate::core::types::{ToolOutput, ToolSpec};
 
+pub mod apply_patch;
 pub mod builtins;
 pub mod optimize;
 pub mod subagent;
