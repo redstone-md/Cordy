@@ -468,13 +468,19 @@ mod tests {
             .spawn(prog, mkargs("echo hello_bg"), dir.path(), "echo hello_bg")
             .unwrap();
 
-        // Wait for it to finish.
-        for _ in 0..40 {
+        // Wait for it to finish. The window is generous because a cold PowerShell can take
+        // several seconds to start on a loaded CI runner.
+        for _ in 0..300 {
             if reg.is_done(&id) == Some(true) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        assert_eq!(
+            reg.is_done(&id),
+            Some(true),
+            "background job never finished"
+        );
         let (out, status) = reg.read_new(&id).unwrap();
         assert!(out.contains("hello_bg"), "got: {out}");
         assert!(status.starts_with("exited"), "status: {status}");
